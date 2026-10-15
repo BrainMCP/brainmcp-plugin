@@ -6,7 +6,7 @@ export function parseClaudeEvent(raw, eventName = 'SessionStart') {
         sessionKey: input.session_id || 'default_session',
         cwd: input.cwd,
         source: input.source,
-        transcriptPath: input.transcript_path,
+        transcriptPath: typeof input.transcript_path === 'string' ? input.transcript_path : undefined,
         prompt: input.prompt,
         toolName: input.tool_name,
         toolInput: input.tool_input,

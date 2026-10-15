@@ -6,6 +6,7 @@ import { clientLabel, guidancePreamble, renderGuidance, resolveWorkspace, target
 import { applyChanges, exists, readText, renderDiff, toAbsolute } from '../lib/files.js';
 import { splitTomlSections, parseJsonc, removeJsoncPath, removeJsonServer, removeMarkdownBlock, removeTomlBlock, upsertJsoncPath, upsertJsonServer, upsertMarkdownBlock, upsertTomlBlock } from '../lib/managed.js';
 import { checkCredentialHealth, checkRuntimeDrift, checkConsentPreferences, checkQueueStatus, checkCompanionApiTarget } from '../runtime/doctor-checks.js';
+import { checkProjectBinding } from './bind.js';
 import { companionWorkspacesUrl } from '../lib/endpoints.js';
 import { getBrainHome } from '../runtime/storage.js';
 import { CliConfigurationError, isWorkspaceUuid } from '../lib/cli-contracts.js';
@@ -129,7 +130,7 @@ function renderSetupNextSteps(clients, scope, workspace) {
     return [
         '',
         'Next steps:',
-        '1. Sign in at https://dash.brainmcp.ai and create one workspace for this project if you do not already have one.',
+        '1. Sign in at https://dash.brainmcp.ai and create one workspace for this project if you do not already have one (or ask a connected agent to create it). Bind each repository to its workspace with `brainmcp bind --workspace <uuid>`.',
         `2. Keep the reserved brain server in exactly one MCP config scope per client (project or user), then restart or reopen ${clientList}.`,
         '3. Log in to brain from every client you plan to use:',
         ...authorizationSteps,
@@ -447,6 +448,8 @@ export async function doctor(options) {
     checks.push([consentCheck.name, consentCheck.passed, consentCheck.detail]);
     const queueCheck = checkQueueStatus(brainHome);
     checks.push([queueCheck.name, queueCheck.passed, queueCheck.detail]);
+    if (options.scope === 'project')
+        checks.push(checkProjectBinding(options.root, brainHome));
     for (const [name, passed, detail] of checks)
         options.output(`${passed ? '✓' : '✗'} ${name}: ${detail}`);
     if (checks.some(([, passed]) => !passed))

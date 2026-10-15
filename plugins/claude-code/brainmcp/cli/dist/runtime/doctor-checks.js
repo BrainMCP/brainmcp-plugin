@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { validatePreferencesRecord } from '../lib/cli-contracts.js';
+import { DIGEST_CAP_ERROR_CODE, queueItemFailureClass } from './flush.js';
 import { describeCredentialsError, parseStoredCredentials } from '../lib/credentials.js';
 import { getBrainHome, getCurrentAccountId, readSafeJson, resolveStateDir } from './storage.js';
 import { listInstalledRuntimes, readRuntimeShimTarget } from './installer.js';
@@ -215,6 +216,51 @@ export function checkCompanionApiTarget(env = process.env) {
         };
     }
 }
+const CAPTURE_QUEUE_CAUSES = {
+    digest_cap: {
+        label: 'workspace pending-digest cap reached (pending_digest_cap_reached)',
+        fix: 'the workspace holds 100 unprocessed digests; have an agent process them (brain_digest_pending, then brain_digest_complete)',
+    },
+    auth_required: {
+        label: 'sign-in expired or was revoked',
+        fix: 'run "brainmcp login --capture-digests"',
+    },
+    terminal: {
+        label: 'permission or scope denied',
+        fix: 'check the grant has digests:write and reaches the capture workspace ("brainmcp whoami")',
+    },
+    non_retryable: {
+        label: 'refused by the server',
+        fix: 'see lastError in the queue item; "brainmcp capture purge-local" clears it',
+    },
+    retry_exhausted: {
+        label: 'retries ran out (network or server errors)',
+        fix: '"brainmcp capture purge-local" clears it; later captures retry on their own',
+    },
+    delivery_unknown: {
+        label: 'delivery outcome unknown',
+        fix: 'it is retried; the server ignores a digest it already holds',
+    },
+};
+/**
+ * Why an undelivered item is stuck, or undefined for one that is simply
+ * queued. A digest-cap refusal is named from `lastErrorCode` (0.1.38+) or,
+ * for items failed by older runtimes, from the API message in `lastError`.
+ */
+export function captureQueueItemCause(item) {
+    const capRefusal = item.lastErrorCode === DIGEST_CAP_ERROR_CODE ||
+        /pending session digest cap|pending_digest_cap_reached/i.test(item.lastError ?? '');
+    if (item.status === 'failed') {
+        if (capRefusal)
+            return 'digest_cap';
+        return queueItemFailureClass(item) ?? 'non_retryable';
+    }
+    if (item.status === 'pending' && capRefusal)
+        return 'digest_cap';
+    if (item.status === 'delivery_unknown')
+        return 'delivery_unknown';
+    return undefined;
+}
 export function checkQueueStatus(baseDir) {
     try {
         const items = listQueueItems(baseDir);
@@ -227,12 +273,22 @@ export function checkQueueStatus(baseDir) {
                 detail: 'queue clean (0 pending items)',
             };
         }
-        const hasFailed = failed.length > 0;
+        const counts = new Map();
+        for (const item of items) {
+            const cause = captureQueueItemCause(item);
+            if (cause)
+                counts.set(cause, (counts.get(cause) ?? 0) + 1);
+        }
+        const causes = [...counts].map(([cause, count]) => `${count} × ${CAPTURE_QUEUE_CAUSES[cause].label}: ${CAPTURE_QUEUE_CAUSES[cause].fix}`);
+        // Items waiting out the digest cap are not failures, but the cause needs action.
+        const hasFailed = failed.length > 0 || counts.has('digest_cap');
         return {
             name: 'capture queue',
             passed: !hasFailed,
-            detail: `${pending.length} pending, ${failed.length} failed out of ${items.length} total`,
-            repairGuidance: hasFailed ? 'Run "brainmcp capture purge-local" to clear failed items' : undefined,
+            detail: `${pending.length} pending, ${failed.length} failed out of ${items.length} total${causes.length ? `; ${causes.join('; ')}` : ''}`,
+            repairGuidance: failed.length > 0
+                ? 'Run "brainmcp capture purge-local" to clear failed items'
+                : hasFailed ? `Have an agent process the workspace's pending digests; ${CAPTURE_QUEUE_CAUSES.digest_cap.label} clears then` : undefined,
         };
     }
     catch (err) {

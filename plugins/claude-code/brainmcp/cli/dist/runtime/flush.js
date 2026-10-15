@@ -4,6 +4,7 @@ import { listQueueItems, updateQueueItem, getQueueDir } from './queue.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { readPreferences, readSafeJson, resolveStateDir, writeAtomic0600 } from './storage.js';
 import { SessionLockTimeoutError, withSessionLock } from './lock.js';
+import { queuedItemProjectAllowsCapture } from './capture.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,6 +12,19 @@ export const MAX_CAPTURE_QUEUE_ITEMS = 50;
 export const MAX_CAPTURE_QUEUE_BYTES = 10 * 1024 * 1024;
 export const MAX_CAPTURE_ATTEMPTS = 8;
 const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 32_000, 32_000];
+/** The API's code for a workspace holding its maximum of unprocessed digests. */
+export const DIGEST_CAP_ERROR_CODE = 'pending_digest_cap_reached';
+/**
+ * How long a digest waits after the workspace refused it for its pending
+ * cap. The cap clears only when an agent processes digests, which seconds of
+ * backoff never saw: through 0.1.37 every item spent its 8 attempts within
+ * about two minutes and ended `failed` (2026-10-15). A refusal for the cap
+ * spends no attempt; local retention still drops an item after 7 days.
+ */
+export const DIGEST_CAP_RETRY_MS = 30 * 60 * 1000;
+export function isDigestCapRefusal(status, code) {
+    return status === 409 && code === DIGEST_CAP_ERROR_CODE;
+}
 export function classifyCaptureFailure(status, message, code) {
     if (status === 401 || /unauthorized|invalid_token|auth_required/i.test(message ?? '')) {
         return 'auth_required';
@@ -19,7 +33,7 @@ export function classifyCaptureFailure(status, message, code) {
         return 'terminal';
     }
     // The workspace's pending-digest cap clears once an agent processes digests.
-    if (status === 409 && code === 'pending_digest_cap_reached') {
+    if (isDigestCapRefusal(status, code)) {
         return 'retryable';
     }
     if (status === 400 || (status !== null && status >= 400 && status < 500 && status !== 429)) {
@@ -148,6 +162,28 @@ async function postDigest(apiClient, item, signal, beforeSend, timeoutMs) {
         return { ok: false, status, message, code };
     }
 }
+/**
+ * Hold a waiting item back until `retryAt` without spending an attempt, after
+ * its workspace refused another digest for the pending cap. Only an item
+ * nobody is sending is touched; a busy queue lock leaves it for the next run.
+ */
+async function deferForDigestCap(digestId, retryAt, baseDir) {
+    try {
+        return await withSessionLock('capture-queue', () => {
+            const current = listQueueItems(baseDir).find((queued) => queued.digestId === digestId);
+            if (!current || !['pending', 'delivery_unknown'].includes(current.status) ||
+                (current.deliveryLease && Date.parse(current.deliveryLease.expiresAt) > Date.now()))
+                return false;
+            updateQueueItem(digestId, { nextRetryAt: retryAt, lastErrorCode: DIGEST_CAP_ERROR_CODE }, baseDir);
+            return true;
+        }, { baseDir, timeoutMs: CAPTURE_QUEUE_LOCK_TIMEOUT_MS });
+    }
+    catch (error) {
+        if (error instanceof SessionLockTimeoutError)
+            return false;
+        throw error;
+    }
+}
 export async function flushCaptureQueue(options) {
     // Pin this run to one physical account namespace, including completion after
     // another process switches the active account.
@@ -159,6 +195,8 @@ export async function flushCaptureQueue(options) {
     const credentials = options.credentials === undefined
         ? await options.apiClient.getEffectiveCredentials()
         : options.credentials;
+    /** Workspace id → when its digests may be sent again, after a pending-cap refusal in this run. */
+    const cappedWorkspaces = new Map();
     for (const item of items) {
         if (options.signal?.aborted)
             break;
@@ -179,12 +217,15 @@ export async function flushCaptureQueue(options) {
             continue;
         }
         const isAutomatic = item.captureTrigger !== 'manual';
+        // Rechecked before the claim and again right before the request: the item's
+        // own projects, not the starting hook's, decide whether it may leave.
         const consentStillMatches = () => {
             const prefs = readPreferences(options.baseDir);
             return prefs?.consent?.captureEnabled === true &&
                 (!isAutomatic || options.allowAutomatic === true) &&
                 item.consentRevision !== undefined && item.consentRevision === (prefs.consent.revision ?? 0) &&
-                (!isAutomatic || item.workspaceId === prefs.enabledWorkspaceId);
+                (!isAutomatic || item.workspaceId === prefs.enabledWorkspaceId) &&
+                queuedItemProjectAllowsCapture(item, item.workspaceId);
         };
         if (isAutomatic) {
             if (!consentStillMatches()) {
@@ -202,6 +243,16 @@ export async function flushCaptureQueue(options) {
             continue;
         }
         if (!credentials?.scopes?.includes('digests:write') || !credentials.workspaces?.includes(item.workspaceId)) {
+            result.skipped += 1;
+            continue;
+        }
+        const capRetryAt = cappedWorkspaces.get(item.workspaceId);
+        if (capRetryAt) {
+            // Its workspace refused a digest for the pending cap in this run, and
+            // would refuse this one the same way.
+            if (await deferForDigestCap(item.digestId, capRetryAt, options.baseDir)) {
+                result.deferredForDigestCap = (result.deferredForDigestCap ?? 0) + 1;
+            }
             result.skipped += 1;
             continue;
         }
@@ -267,7 +318,7 @@ export async function flushCaptureQueue(options) {
             return true;
         }, requestTimeoutMs);
         if (response.ok) {
-            await finish({ status: 'delivered', deliveredAt: new Date().toISOString(), lastError: undefined, nextRetryAt: undefined });
+            await finish({ status: 'delivered', deliveredAt: new Date().toISOString(), lastError: undefined, lastErrorCode: undefined, nextRetryAt: undefined });
             result.sent += 1;
             continue;
         }
@@ -289,21 +340,40 @@ export async function flushCaptureQueue(options) {
         // it is delivered, not failed. On a first attempt it is a real collision.
         if (response.status === 409 && response.code === 'digest_id_conflict' &&
             (statusBeforeClaim === 'delivery_unknown' || claimed.attempts > 0)) {
-            await finish({ status: 'delivered', deliveredAt: new Date().toISOString(), lastError: undefined, nextRetryAt: undefined });
+            await finish({ status: 'delivered', deliveredAt: new Date().toISOString(), lastError: undefined, lastErrorCode: undefined, nextRetryAt: undefined });
             logRuntimeEvent('info', 'capture_already_held', { digestId: claimed.digestId, code: response.code }, options.baseDir);
             result.sent += 1;
             continue;
         }
         const klass = classifyCaptureFailure(response.status, response.message, response.code);
         result.lastFailureClass = klass;
+        // The workspace holds its maximum of unprocessed digests and stored nothing.
+        // That clears only when an agent processes digests, so the item waits
+        // without spending an attempt, and so does the rest of that workspace's queue.
+        if (isDigestCapRefusal(response.status, response.code)) {
+            const retryAt = new Date((options.now ?? Date.now()) + DIGEST_CAP_RETRY_MS).toISOString();
+            cappedWorkspaces.set(claimed.workspaceId, retryAt);
+            await finish({
+                status: statusBeforeClaim === 'delivery_unknown' ? 'delivery_unknown' : 'pending',
+                nextRetryAt: retryAt,
+                lastError: response.message,
+                lastErrorCode: DIGEST_CAP_ERROR_CODE,
+            });
+            logRuntimeEvent('warn', 'capture_digest_cap_reached', { digestId: claimed.digestId }, options.baseDir);
+            result.deferredForDigestCap = (result.deferredForDigestCap ?? 0) + 1;
+            result.failed += 1;
+            continue;
+        }
         if (klass === 'auth_required' || klass === 'terminal' || klass === 'non_retryable') {
-            await finish({ status: 'failed', failureClass: klass, lastError: response.message ?? 'non-retryable capture failure', attempts: claimed.attempts + 1 });
+            await finish({ status: 'failed', failureClass: klass, lastError: response.message ?? 'non-retryable capture failure',
+                lastErrorCode: response.code, attempts: claimed.attempts + 1 });
             result.failed += 1;
             continue;
         }
         const attempts = claimed.attempts + 1;
         if (attempts >= MAX_CAPTURE_ATTEMPTS) {
-            await finish({ status: 'failed', failureClass: 'retry_exhausted', attempts, lastError: response.message ?? 'retry limit reached' });
+            await finish({ status: 'failed', failureClass: 'retry_exhausted', attempts, lastError: response.message ?? 'retry limit reached',
+                lastErrorCode: response.code });
             result.failed += 1;
             continue;
         }
@@ -315,6 +385,7 @@ export async function flushCaptureQueue(options) {
             // Back off from when this attempt ended: a slow request must not leave the retry already due.
             nextRetryAt: nextRetryAt(attempts, options.now ?? Date.now()),
             lastError: response.message,
+            lastErrorCode: response.code,
         });
         if (unknown)
             result.unknown += 1;

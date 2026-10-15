@@ -14,6 +14,7 @@ export function parseCodexEvent(raw, eventName = 'SessionStart') {
         sessionKey: input.session_id || 'default_session',
         cwd: input.cwd,
         source: input.source,
+        transcriptPath: typeof input.transcript_path === 'string' ? input.transcript_path : undefined,
         status: input.status ?? input.reason,
         prompt: input.prompt,
         toolName: input.tool_name,

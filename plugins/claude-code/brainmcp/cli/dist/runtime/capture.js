@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CAPTURE_POLICY_VERSION, scrubDigestSecrets } from '../agent-config.js';
-import { PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, } from '../lib/cli-contracts.js';
+import { MAX_QUEUE_PROJECT_ROOTS, PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, } from '../lib/cli-contracts.js';
 import { readPreferences, writePreferences } from './storage.js';
 import { listQueueItems, updateQueueItem } from './queue.js';
 import { logRuntimeEvent } from './diagnostics.js';
@@ -468,6 +468,28 @@ export function isCaptureEligible(event, prefs, projectPolicy) {
         return false;
     }
     return CAPTURE_EVENTS.has(event);
+}
+/**
+ * The project roots a hook or `capture now` records on its queue item, so each
+ * send can re-read their policy. Resolved, deduplicated and bounded; never sent.
+ */
+export function queueProjectRoots(roots) {
+    return [...new Set(roots.map((root) => path.resolve(root)))].slice(0, MAX_QUEUE_PROJECT_ROOTS);
+}
+/**
+ * Whether the projects a queued item was captured in still allow sending it
+ * to `workspaceId`: each root's nearest `.brainmcp.json` is re-read for an
+ * opt-out and for a binding to another (or no valid) workspace. An automatic
+ * item queued before 0.1.38 records no roots and fails closed; such a manual
+ * item was an explicit `capture now` and keeps its earlier behavior.
+ */
+export function queuedItemProjectAllowsCapture(item, workspaceId) {
+    const roots = item.projectRoots;
+    if (!roots)
+        return item.captureTrigger === 'manual';
+    if (roots.some((root) => readProjectCaptureRestrictions(root).captureDisabled))
+        return false;
+    return !projectBindingBlocksCapture(roots, workspaceId);
 }
 /** A capture cannot override the nearest project binding or an invalid policy file. */
 export function projectBindingBlocksCapture(roots, workspaceId) {

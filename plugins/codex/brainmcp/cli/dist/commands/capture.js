@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { CAPTURE_POLICY_VERSION } from '../agent-config.js';
-import { enableCapture, disableCapture, buildDigestPayload, collectGitMetadata, serializeDigestPayload, MAX_DIGEST_BYTES, MAX_DIGEST_CHARS, readProjectCaptureRestrictions, captureProjectKey, captureProjectBindingConflict, } from '../runtime/capture.js';
+import { enableCapture, disableCapture, buildDigestPayload, collectGitMetadata, serializeDigestPayload, MAX_DIGEST_BYTES, MAX_DIGEST_CHARS, readProjectCaptureRestrictions, captureProjectKey, captureProjectBindingConflict, queueProjectRoots, } from '../runtime/capture.js';
 import { readPreferences, resolveStateDir } from '../runtime/storage.js';
 import { listQueueItems, updateQueueItem } from '../runtime/queue.js';
 import { flushCaptureQueue, queueItemFailureClass, readCaptureStatus, MAX_CAPTURE_ATTEMPTS, } from '../runtime/flush.js';
@@ -575,6 +575,7 @@ export async function captureNow(options) {
             digestText: serializeDigestPayload(payload),
             authorizationId: run.authorizationId,
             consentRevision: run.consentRevision,
+            projectRoots: queueProjectRoots([options.cwd ?? process.cwd()]),
         },
     });
     // Advancing lastCapturedSequence at enqueue is deliberate (concurrent hooks

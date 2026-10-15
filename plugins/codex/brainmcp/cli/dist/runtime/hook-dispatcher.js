@@ -7,8 +7,9 @@ import { logRuntimeEvent } from './diagnostics.js';
 import { readPreferences, resolveStateDir } from './storage.js';
 import { pruneLocalState } from './retention.js';
 import { withRequestDeadline } from '../lib/http.js';
-import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
+import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, queueProjectRoots, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
 import { canEnqueueCapture } from './flush.js';
+import { readTranscriptSummary } from './transcript-summary.js';
 import { isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
 import { pluginSessionStartContext } from './plugin-guidance.js';
 import { ApiClient } from '../lib/api-client.js';
@@ -228,6 +229,23 @@ export async function readBoundedStdin(stream = process.stdin, maxBytes = MAX_ST
             abort();
     });
 }
+/**
+ * The closing replies of the latest turns in the host's transcript, or
+ * undefined. Logs only why it found none (a content-free class).
+ */
+function hostTranscriptSummary(event, baseDir) {
+    let result;
+    try {
+        result = readTranscriptSummary(event.transcriptPath);
+    }
+    catch {
+        result = { failure: 'read_error' };
+    }
+    if ('summary' in result)
+        return result.summary;
+    logRuntimeEvent('info', 'capture_transcript_summary_unavailable', { event: event.event, client: event.client, reason: result.failure }, baseDir);
+    return undefined;
+}
 /** A plugin's SessionStart also carries the always-on guidance it cannot install as a file. */
 function pluginContext(event, context, lookup) {
     const roots = event.workspaceRoots?.length ? event.workspaceRoots : event.cwd ? [event.cwd] : [];
@@ -391,6 +409,11 @@ export async function dispatchHookEvent(event, options) {
             event.event === 'UserPrompt' ||
             event.event === 'prompt' ||
             (event.toolName && !isReadOnlyToolName(event.toolName)));
+        // Claude Code and Codex hooks carry no assistant text, so at a capture
+        // boundary the host's own transcript supplies the turns' closing replies.
+        const transcriptSummary = captureRuntimeEnabled && captureTriggerForEvent(event.event) && event.transcriptPath
+            ? hostTranscriptSummary(event, options.baseDir)
+            : undefined;
         if (isSessionStartEvent(event.event))
             pruneLocalState({ baseDir: options.baseDir });
         const ledger = await recordSessionEvent({
@@ -399,7 +422,7 @@ export async function dispatchHookEvent(event, options) {
             isMeaningful,
             editedPath: captureRuntimeEnabled ? editedPathFromEvent(event) : undefined,
             prompt: persistPrompts ? event.prompt : undefined,
-            assistantSummary: captureRuntimeEnabled ? event.assistantText : undefined,
+            assistantSummary: captureRuntimeEnabled ? event.assistantText ?? transcriptSummary : undefined,
             model: captureRuntimeEnabled ? event.model : undefined,
             persistPrompts,
             captureRevision: captureRuntimeEnabled ? prefs?.consent.revision ?? 0 : undefined,
@@ -507,47 +530,60 @@ export async function dispatchHookEvent(event, options) {
                     logRuntimeEvent('warn', 'capture_authorization_unresolved', { event: event.event, sessionKey: event.sessionKey }, options?.baseDir);
                 }
                 else {
-                    const payload = buildDigestPayload({
-                        trigger,
-                        workspaceId,
-                        host: event.client,
-                        model: event.model ?? ledger.model,
-                        summary: ledger.assistantSummary,
-                        paths: ledger.editedPaths,
-                        gitMetadata: collectGitMetadata(event.cwd ?? event.workspaceRoots?.[0], {
-                            trigger,
-                            deadlineAt: deadlineAt - CAPTURE_QUEUE_RESERVE_MS,
-                            baseDir: options?.baseDir,
-                        }),
-                        prompts: ledger.prompts,
-                        includePrompts: Boolean(prefs?.consent?.includePrompts && !projectPolicy.promptsDisabled),
-                    });
-                    const queued = await queueSessionCapture({
-                        sessionKey: event.sessionKey,
-                        capturedThroughSequence: ledger.lastMeaningfulSequence ?? ledger.eventSequence,
-                        baseDir: options?.baseDir,
-                        item: {
-                            digestId: payload.clientDigestId,
-                            workspaceId,
-                            captureTrigger: trigger,
-                            policyVersion: prefs?.consent?.policyVersion ?? CAPTURE_POLICY_VERSION,
-                            digestText: serializeDigestPayload(payload),
-                            authorizationId: creds.authorizationId,
-                            consentRevision: prefs?.consent?.revision ?? 0,
-                        },
-                    });
-                    // Log the slice's derived queue ID, and only when this slice has an item.
-                    // A slice another hook already reserved needs no entry.
-                    if (queued.kind === 'queued' || queued.kind === 'existing') {
-                        logRuntimeEvent('info', 'capture_queued', {
-                            sessionKey: event.sessionKey,
-                            digestId: queued.item.digestId,
-                            trigger,
-                            ...(queued.kind === 'existing' ? { existing: true } : {}),
-                        }, options?.baseDir);
+                    // A host with a transcript summarizes each slice from it; when that read
+                    // fails, the ledger's summary belongs to an earlier slice and is not resent.
+                    const summary = event.transcriptPath ? transcriptSummary : ledger.assistantSummary;
+                    const includePrompts = Boolean(prefs?.consent?.includePrompts && !projectPolicy.promptsDisabled);
+                    if (!summary?.trim() && !(includePrompts && ledger.prompts?.length)) {
+                        // Paths and Git counts alone hold nothing to process, and such digests
+                        // filled the workspace's pending-digest cap (2026-10-15). The slice
+                        // stays uncaptured, so a later boundary can still send it.
+                        logRuntimeEvent('info', 'capture_skipped_no_summary', { event: event.event, sessionKey: event.sessionKey, client: event.client }, options?.baseDir);
                     }
-                    else if (queued.kind === 'queue_full') {
-                        logRuntimeEvent('warn', 'capture_queue_capped', { event: event.event, sessionKey: event.sessionKey }, options?.baseDir);
+                    else {
+                        const payload = buildDigestPayload({
+                            trigger,
+                            workspaceId,
+                            host: event.client,
+                            model: event.model ?? ledger.model,
+                            summary,
+                            paths: ledger.editedPaths,
+                            gitMetadata: collectGitMetadata(event.cwd ?? event.workspaceRoots?.[0], {
+                                trigger,
+                                deadlineAt: deadlineAt - CAPTURE_QUEUE_RESERVE_MS,
+                                baseDir: options?.baseDir,
+                            }),
+                            prompts: ledger.prompts,
+                            includePrompts,
+                        });
+                        const queued = await queueSessionCapture({
+                            sessionKey: event.sessionKey,
+                            capturedThroughSequence: ledger.lastMeaningfulSequence ?? ledger.eventSequence,
+                            baseDir: options?.baseDir,
+                            item: {
+                                digestId: payload.clientDigestId,
+                                workspaceId,
+                                captureTrigger: trigger,
+                                policyVersion: prefs?.consent?.policyVersion ?? CAPTURE_POLICY_VERSION,
+                                digestText: serializeDigestPayload(payload),
+                                authorizationId: creds.authorizationId,
+                                consentRevision: prefs?.consent?.revision ?? 0,
+                                projectRoots: queueProjectRoots(roots),
+                            },
+                        });
+                        // Log the slice's derived queue ID, and only when this slice has an item.
+                        // A slice another hook already reserved needs no entry.
+                        if (queued.kind === 'queued' || queued.kind === 'existing') {
+                            logRuntimeEvent('info', 'capture_queued', {
+                                sessionKey: event.sessionKey,
+                                digestId: queued.item.digestId,
+                                trigger,
+                                ...(queued.kind === 'existing' ? { existing: true } : {}),
+                            }, options?.baseDir);
+                        }
+                        else if (queued.kind === 'queue_full') {
+                            logRuntimeEvent('warn', 'capture_queue_capped', { event: event.event, sessionKey: event.sessionKey }, options?.baseDir);
+                        }
                     }
                 }
             }

@@ -23,6 +23,7 @@ export function enqueueCaptureItem(item, baseDir) {
         digestText: item.digestText,
         authorizationId: item.authorizationId,
         consentRevision: item.consentRevision,
+        ...(item.projectRoots ? { projectRoots: item.projectRoots } : {}),
         status: 'pending',
         attempts: 0,
         createdAt: now,

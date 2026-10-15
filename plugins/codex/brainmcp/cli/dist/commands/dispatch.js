@@ -10,6 +10,7 @@ import { SessionLockTimeoutError } from '../runtime/lock.js';
 import { cliPackageVersion } from '../runtime/installer.js';
 import { doctor, init, initAll, printConfig, remove, } from './index.js';
 import { login, logout, whoami } from './auth.js';
+import { bindProject } from './bind.js';
 import { runHookRuntimeCli } from '../runtime/index.js';
 import { captureStatus, captureEnable, captureDisable, captureNow, capturePurgeLocal, capturePurgePreview, } from './capture.js';
 export const HELP = `brainmcp — configure BrainMCP for agent projects and authenticate companion CLI
@@ -28,6 +29,8 @@ Usage:
   brainmcp whoami [--json]
   brainmcp hook <client> <event>
   brainmcp capture [enable|disable|status|now|purge-local] [--dry-run] [--workspace <uuid>] [--include-prompts] [--yes] [--json]
+  brainmcp bind [--workspace <uuid>] [--root <dir>] [--yes] [--json]
+  brainmcp unbind [--root <dir>] [--yes] [--json]
   brainmcp --help | -h
   brainmcp --version | -v
 
@@ -36,6 +39,8 @@ Clients: ${CLIENT_IDS.join(', ')}
 Project scope is the default. User scope writes to each host's supported per-user locations.
 When the brainmcp plugin is enabled in Claude Code or Codex, init leaves the MCP entry and hooks to the
 plugin (removing any it wrote earlier) and writes only guidance; --ignore-plugin keeps the old behavior.
+bind writes the project's .brainmcp.json workspace binding (the nearest one, else one at the Git root), so
+agents there orient to that workspace and capture never lands in another; bind alone shows the binding.
 Every mutation previews a diff and needs confirmation unless a trailing CLI --yes is supplied.
 The leading npx --yes above accepts npm's package download; it does not skip the file preview.`;
 /** Positional actions; only `capture` takes them. */
@@ -360,6 +365,22 @@ export async function dispatch(rawArgs, context = {}) {
                 }
                 return result.exitCode;
             }
+            case 'bind':
+            case 'unbind':
+                if (parsed.command === 'unbind' && parsed.workspace) {
+                    console.error('unbind takes no --workspace; it removes the current binding.');
+                    return CLI_EXIT_CODES.USAGE_ERROR;
+                }
+                return await bindProject({
+                    startDir: parsed.root ?? currentRoot,
+                    workspace: parsed.workspace,
+                    unbind: parsed.command === 'unbind',
+                    yes: parsed.yes,
+                    json: parsed.json,
+                    baseDir: context.baseDir,
+                    output,
+                    confirm: confirmFn,
+                });
             default:
                 console.error(`Unknown command: ${parsed.command}\n\n${HELP}`);
                 return CLI_EXIT_CODES.USAGE_ERROR;

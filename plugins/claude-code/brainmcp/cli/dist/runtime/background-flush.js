@@ -161,8 +161,10 @@ async function loadBackgroundClient(brainHome) {
 /**
  * The detached process: deliver due automatic items, wait out retry backoff
  * while the next retry still fits the deadline, then release the lease. Every
- * consent, authorization, and workspace check in `flushCaptureQueue` applies;
- * the starting hook already checked its project's capture policy.
+ * consent, authorization, and workspace check in `flushCaptureQueue` applies,
+ * including each item's own project policy (`queuedItemProjectAllowsCapture`):
+ * the starting hook vouches only for its own project, not for items another
+ * project queued or a retry waiting since that project opted out.
  */
 export async function runBackgroundCaptureFlush(options) {
     const stateDir = resolveStateDir(options.baseDir);

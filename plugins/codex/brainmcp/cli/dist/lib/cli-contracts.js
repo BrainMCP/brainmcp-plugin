@@ -120,6 +120,10 @@ export function validateSessionLedgerRecord(data) {
         workspaceId: typeof obj.workspaceId === 'string' ? obj.workspaceId : undefined,
     };
 }
+/** Bounds for `projectRoots`: hosts report a handful of workspace folders. */
+export const MAX_QUEUE_PROJECT_ROOTS = 32;
+const MAX_QUEUE_PROJECT_ROOT_CHARS = 4096;
+const QUEUE_ERROR_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
 // `satisfies` makes typecheck fail when a contract value is added or removed.
 const CAPTURE_TRIGGERS = { manual: true, pre_compact: true, session_end: true };
 const CAPTURE_FAILURE_CLASSES = {
@@ -177,6 +181,8 @@ export function validateQueueItemRecord(data) {
         attempts: typeof obj.attempts === 'number' ? obj.attempts : 0,
         nextRetryAt: typeof obj.nextRetryAt === 'string' ? obj.nextRetryAt : undefined,
         lastError: typeof obj.lastError === 'string' ? obj.lastError : undefined,
+        lastErrorCode: typeof obj.lastErrorCode === 'string' && QUEUE_ERROR_CODE_RE.test(obj.lastErrorCode)
+            ? obj.lastErrorCode : undefined,
         createdAt: typeof obj.createdAt === 'string' ? obj.createdAt : new Date().toISOString(),
         updatedAt: typeof obj.updatedAt === 'string'
             ? obj.updatedAt
@@ -191,6 +197,10 @@ export function validateQueueItemRecord(data) {
         // Advisory only (the status decides delivery), so an unknown value is dropped, not rejected.
         failureClass: typeof obj.failureClass === 'string' && Object.hasOwn(CAPTURE_FAILURE_CLASSES, obj.failureClass)
             ? obj.failureClass : undefined,
+        // A malformed list reads as missing, which the flush treats as unverifiable.
+        projectRoots: Array.isArray(obj.projectRoots) && obj.projectRoots.length <= MAX_QUEUE_PROJECT_ROOTS &&
+            obj.projectRoots.every((root) => typeof root === 'string' && root.length > 0 && root.length <= MAX_QUEUE_PROJECT_ROOT_CHARS)
+            ? [...obj.projectRoots] : undefined,
     };
 }
 // =====================================================================
