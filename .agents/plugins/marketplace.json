@@ -1,0 +1,20 @@
+{
+  "name": "brainmcp",
+  "interface": {
+    "displayName": "brainMCP"
+  },
+  "plugins": [
+    {
+      "name": "brainmcp",
+      "source": "./plugins/codex/brainmcp",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL",
+        "products": [
+          "codex"
+        ]
+      },
+      "category": "Productivity"
+    }
+  ]
+}

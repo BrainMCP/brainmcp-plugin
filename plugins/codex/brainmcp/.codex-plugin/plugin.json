@@ -1,0 +1,42 @@
+{
+  "name": "brainmcp",
+  "version": "0.1.36",
+  "description": "Shared, reviewable project memory for coding agents: the brain MCP server, usage and setup skills, and orientation plus opt-in session-capture hooks.",
+  "author": {
+    "name": "BrainMCP",
+    "email": "team@brainmcp.ai",
+    "url": "https://www.brainmcp.ai"
+  },
+  "homepage": "https://www.brainmcp.ai/docs/connect-codex",
+  "repository": "https://github.com/BrainMCP/brainmcp-plugin",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "memory",
+    "knowledge-graph",
+    "project-context"
+  ],
+  "skills": "./skills",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "brainMCP",
+    "shortDescription": "Reviewable project memory",
+    "longDescription": "Connects Codex to the brain MCP server (graph memory where every write is a reviewable proposal), adds the using-brainmcp and setup skills, and installs SessionStart orientation plus opt-in session-capture hooks. Codex runs the hooks only after you trust them.",
+    "developerName": "BrainMCP",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://www.brainmcp.ai/docs/connect-codex",
+    "supportURL": "https://www.brainmcp.ai/docs/troubleshooting",
+    "privacyPolicyURL": "https://www.brainmcp.ai/privacy",
+    "termsOfServiceURL": "https://www.brainmcp.ai/terms",
+    "defaultPrompt": [
+      "Use brain to give me an overview of this workspace."
+    ],
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.png"
+  }
+}

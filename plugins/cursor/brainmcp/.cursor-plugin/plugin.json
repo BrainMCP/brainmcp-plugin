@@ -1,0 +1,25 @@
+{
+  "name": "brainmcp",
+  "displayName": "brainMCP",
+  "version": "0.1.36",
+  "description": "Shared, reviewable project memory for Cursor agents: the brain MCP server, an always-on rule, and the using-brainmcp skill.",
+  "author": {
+    "name": "BrainMCP",
+    "email": "team@brainmcp.ai"
+  },
+  "publisher": "BrainMCP",
+  "homepage": "https://www.brainmcp.ai/docs/connect-cursor",
+  "repository": "https://github.com/BrainMCP/brainmcp-plugin",
+  "license": "MIT",
+  "logo": "assets/logo.png",
+  "keywords": [
+    "mcp",
+    "memory",
+    "knowledge-graph",
+    "project-context"
+  ],
+  "category": "productivity",
+  "mcpServers": "./mcp.json",
+  "skills": "./skills/",
+  "rules": "./rules/"
+}

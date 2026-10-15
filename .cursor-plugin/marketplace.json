@@ -1,0 +1,17 @@
+{
+  "name": "brainmcp",
+  "owner": {
+    "name": "BrainMCP",
+    "email": "team@brainmcp.ai"
+  },
+  "metadata": {
+    "description": "brainMCP plugins for Cursor"
+  },
+  "plugins": [
+    {
+      "name": "brainmcp",
+      "source": "plugins/cursor/brainmcp",
+      "description": "Shared, reviewable project memory for coding agents."
+    }
+  ]
+}

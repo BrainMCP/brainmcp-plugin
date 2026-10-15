@@ -1,0 +1,56 @@
+{
+  "description": "brainMCP orientation and opt-in session capture",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/cli/dist/runtime/index.js\" claude-code SessionStart --from-plugin"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/cli/dist/runtime/index.js\" claude-code UserPromptSubmit --from-plugin"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/cli/dist/runtime/index.js\" claude-code PostToolUse --from-plugin"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/cli/dist/runtime/index.js\" claude-code PreCompact --from-plugin"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/cli/dist/runtime/index.js\" claude-code SessionEnd --from-plugin"
+          }
+        ]
+      }
+    ]
+  }
+}

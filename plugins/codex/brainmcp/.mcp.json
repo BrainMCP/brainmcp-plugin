@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "brain": {
+      "type": "http",
+      "url": "https://mcp.brainmcp.ai/mcp",
+      "oauth_resource": "https://mcp.brainmcp.ai/mcp",
+      "oauth": {
+        "client_id": "codex"
+      }
+    }
+  }
+}

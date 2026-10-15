@@ -1,0 +1,16 @@
+{
+  "name": "brainmcp",
+  "description": "brainMCP plugins for Claude Code",
+  "owner": {
+    "name": "BrainMCP",
+    "email": "team@brainmcp.ai"
+  },
+  "plugins": [
+    {
+      "name": "brainmcp",
+      "source": "./plugins/claude-code/brainmcp",
+      "description": "Shared, reviewable project memory for coding agents.",
+      "category": "productivity"
+    }
+  ]
+}

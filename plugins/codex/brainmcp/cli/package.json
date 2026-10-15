@@ -1,0 +1,13 @@
+{
+  "name": "@brainmcp/brainmcp",
+  "version": "0.1.36",
+  "description": "Safely configure BrainMCP guidance and MCP connections across agent projects",
+  "type": "module",
+  "bin": {
+    "brainmcp": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

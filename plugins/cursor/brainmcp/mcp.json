@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "brain": {
+      "url": "https://mcp.brainmcp.ai/mcp",
+      "auth": {
+        "CLIENT_ID": "cursor"
+      }
+    }
+  }
+}

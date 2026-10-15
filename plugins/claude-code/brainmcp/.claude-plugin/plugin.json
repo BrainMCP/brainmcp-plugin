@@ -1,0 +1,25 @@
+{
+  "name": "brainmcp",
+  "displayName": "brainMCP",
+  "version": "0.1.36",
+  "description": "Shared, reviewable project memory for Claude Code: the brain MCP server, its usage and setup skills, and orientation plus opt-in session-capture hooks.",
+  "author": {
+    "name": "BrainMCP",
+    "email": "team@brainmcp.ai",
+    "url": "https://www.brainmcp.ai"
+  },
+  "homepage": "https://www.brainmcp.ai/docs/connect-claude-code",
+  "repository": "https://github.com/BrainMCP/brainmcp-plugin",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "memory",
+    "knowledge-graph",
+    "project-context"
+  ],
+  "icon": "./assets/icon.png",
+  "documentationUrl": "https://www.brainmcp.ai/docs/connect-claude-code",
+  "supportUrl": "https://www.brainmcp.ai/docs/troubleshooting",
+  "privacyPolicyUrl": "https://www.brainmcp.ai/privacy",
+  "termsOfServiceUrl": "https://www.brainmcp.ai/terms"
+}
