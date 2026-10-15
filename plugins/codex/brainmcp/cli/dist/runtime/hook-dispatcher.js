@@ -9,7 +9,8 @@ import { pruneLocalState } from './retention.js';
 import { withRequestDeadline } from '../lib/http.js';
 import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
 import { canEnqueueCapture } from './flush.js';
-import { isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, withPluginLifecycleReminder, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
+import { isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
+import { pluginSessionStartContext } from './plugin-guidance.js';
 import { ApiClient } from '../lib/api-client.js';
 import { detectHostPlugin, isPluginHost, pluginRunsHook } from '../lib/host-plugins.js';
 import { createDefaultCredentialStore } from '../lib/credentials.js';
@@ -227,6 +228,11 @@ export async function readBoundedStdin(stream = process.stdin, maxBytes = MAX_ST
             abort();
     });
 }
+/** A plugin's SessionStart also carries the always-on guidance it cannot install as a file. */
+function pluginContext(event, context, lookup) {
+    const roots = event.workspaceRoots?.length ? event.workspaceRoots : event.cwd ? [event.cwd] : [];
+    return pluginSessionStartContext(context, { host: event.client, roots, lookup });
+}
 function hostOutput(event, additionalContext) {
     try {
         return emitHostOutput(event.client, event, additionalContext);
@@ -377,7 +383,7 @@ export async function dispatchHookEvent(event, options) {
             return {
                 handled: true,
                 emptyFallback: false,
-                outputPayload: hostOutput(event, event.fromPlugin ? withPluginLifecycleReminder(additionalContext) : additionalContext),
+                outputPayload: hostOutput(event, event.fromPlugin ? pluginContext(event, additionalContext, options?.pluginLookup) : additionalContext),
             };
         }
         const isMeaningful = Boolean(event.prompt ||
@@ -469,7 +475,7 @@ export async function dispatchHookEvent(event, options) {
                 })
                 : loginOrientationMessage(options?.loginCommand);
             if (event.fromPlugin)
-                additionalContext = withPluginLifecycleReminder(additionalContext);
+                additionalContext = pluginContext(event, additionalContext, options?.pluginLookup);
         }
         else if (isUserPromptEvent(event.event)) {
             // AHI-D18: never transmit prompt text as an /orient query.

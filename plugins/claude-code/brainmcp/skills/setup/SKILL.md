@@ -8,7 +8,7 @@ description: Set up or check the brainMCP plugin: sign in the companion CLI that
 The plugin has two independent sign-ins. Never claim one covers the other.
 
 1. **brain MCP server** (the `brain_*` tools). Run `/mcp`, select `plugin:brainmcp:brain`, and choose **Authenticate**.
-2. **Companion CLI**, used only by the plugin hooks: SessionStart orientation and, if the user opts in, session capture. Without it the tools still work and the hooks print a reminder.
+2. **Companion CLI**, used only by the plugin hooks: SessionStart orientation and, if the user opts in, session capture. Without it the tools still work, and SessionStart still adds Brain's always-on guidance with a sign-in reminder.
 
 The CLI ships inside the plugin, so `brainmcp` is not on PATH. Use the full command below; in Claude Code the user can prefix it with `!` to run it in the session.
 

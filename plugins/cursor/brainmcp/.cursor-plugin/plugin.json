@@ -1,7 +1,7 @@
 {
   "name": "brainmcp",
   "displayName": "brainMCP",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "description": "Shared, reviewable project memory for Cursor agents: the brain MCP server, an always-on rule, and the using-brainmcp skill.",
   "author": {
     "name": "BrainMCP",

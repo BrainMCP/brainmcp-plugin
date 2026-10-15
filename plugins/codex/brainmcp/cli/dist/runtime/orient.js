@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ANSWER_GROUNDING_BRIEF_GUIDANCE, WORKSPACE_INFERENCE_GUIDANCE, buildLifecycleOrientationReminder } from '../agent-config.js';
+import { ANSWER_GROUNDING_BRIEF_GUIDANCE, WORKSPACE_INFERENCE_GUIDANCE } from '../agent-config.js';
 import { apiPathSegment } from '../api-client.js';
 import { accessTokenExpiresSoon, CompanionReauthRequiredError } from '../lib/api-client.js';
 import { OAuthRefreshFailedError } from '../lib/oauth-client.js';
@@ -8,7 +8,7 @@ import { COMPANION_WORKSPACES_PATH } from '../lib/endpoints.js';
 import { isWorkspaceUuid } from '../lib/cli-contracts.js';
 import { resolveStateDir } from './storage.js';
 import { logRuntimeEvent } from './diagnostics.js';
-const ORIENT_CONTEXT_MAX_CHARS = 2_400;
+export const ORIENT_CONTEXT_MAX_CHARS = 2_400;
 /** `mustSurfaceToUser` actions shown in the hook packet, one bounded line each. */
 const ORIENT_MAX_SURFACED_ACTIONS = 3;
 const ORIENT_SURFACED_ACTION_MAX_CHARS = 240;
@@ -179,14 +179,6 @@ export function loginOrientationMessage(loginCommand = DEFAULT_COMPANION_LOGIN_C
 // unauthorized based on this packet alone.
 export function reauthOrientationMessage(loginCommand = DEFAULT_COMPANION_LOGIN_COMMAND) {
     return `BrainMCP CLI sign-in expired or was revoked, so companion orientation is off. Only the brainmcp hook is affected: host MCP access is independent, so orient through the host brain_* tools (brain_workspace_overview) before saying Brain is unavailable. Tell the user to run \`${loginCommand}\` to restore companion orientation.`;
-}
-/**
- * A plugin install has no managed instruction block in CLAUDE.md or AGENTS.md,
- * so its SessionStart keeps the lifecycle reminder in front of anything short
- * of a full orientation packet (sign-in prompts, failures, workspace choice).
- */
-export function withPluginLifecycleReminder(context) {
-    return context.startsWith(ORIENT_PACKET_FIRST_LINE) ? context : `${buildLifecycleOrientationReminder()}\n\n${context}`;
 }
 export function companionOrientationFailedMessage(kinds) {
     const reasons = [...new Set(kinds)].join(', ');
