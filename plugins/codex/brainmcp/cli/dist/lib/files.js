@@ -1,6 +1,8 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { access, chmod, copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { access, chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { getBrainHome } from '../runtime/storage.js';
+import { ensureBackupsDir, isCleanInGit, pruneBackups, writeBackup } from './backups.js';
 export async function readText(path) {
     try {
         return await readFile(path, 'utf8');
@@ -56,7 +58,10 @@ export function renderDiff(change) {
         ...after.slice(afterEnd, contextAfterEnd).map((line) => ` ${line}`),
     ].join('\n');
 }
-export async function applyChanges(changes) {
+export async function applyChanges(changes, options = {}) {
+    const brainHome = options.brainHome ?? getBrainHome();
+    const now = options.now ?? Date.now;
+    const isClean = options.isCleanInGit ?? ((path) => isCleanInGit(path));
     const prepared = [];
     // Validate the whole preview before touching any file. This prevents a long
     // confirmation prompt (or another client) from turning a reviewed diff into
@@ -81,9 +86,24 @@ export async function applyChanges(changes) {
             }
             existingMode = (await stat(writePath)).mode & 0o777;
         }
-        prepared.push({ change, writePath, existingMode, symbolicLink });
+        prepared.push({ change, writePath, existingMode, symbolicLink, backup: current !== undefined && change.backup !== false });
     }
-    const backups = [];
+    // A tracked file with no uncommitted change gets no copy: `git restore`
+    // recovers exactly its current content. A tracked file with working-tree or
+    // staged changes is backed up. The check follows a symlink to the file whose
+    // content changes; any Git failure counts as not clean, so that file is backed up.
+    const result = { backups: [], cleanInGit: [] };
+    const clean = await Promise.all(prepared.map((item) => item.backup ? isClean(item.writePath) : Promise.resolve(false)));
+    prepared.forEach((item, index) => {
+        if (!clean[index])
+            return;
+        item.backup = false;
+        result.cleanInGit.push(item.change.path);
+    });
+    // Create (or validate) the backups directory before any file changes, so an
+    // unwritable or symlinked brain home fails the whole run with nothing changed.
+    if (prepared.some((item) => item.backup))
+        ensureBackupsDir(brainHome);
     for (const item of prepared) {
         const { change, writePath, existingMode, symbolicLink } = item;
         if ((await readText(change.path)) !== change.before)
@@ -96,10 +116,9 @@ export async function applyChanges(changes) {
                 throw changedSincePreview(change.path);
         }
         await mkdir(dirname(writePath), { recursive: true });
-        if (change.before !== undefined && change.backup !== false) {
-            const backup = `${change.path}.brainmcp.bak-${Date.now()}-${createHash('sha1').update(change.path).digest('hex').slice(0, 6)}`;
-            await copyFile(change.path, backup);
-            backups.push(backup);
+        if (item.backup) {
+            // Written before the original changes; a failure leaves it untouched.
+            result.backups.push({ path: change.path, backup: writeBackup(change.path, await readFile(change.path), { brainHome, now: now() }) });
         }
         if (change.after === undefined) {
             await rm(change.path, { force: true });
@@ -117,7 +136,15 @@ export async function applyChanges(changes) {
             throw error;
         }
     }
-    return backups;
+    if (result.backups.length > 0) {
+        try {
+            pruneBackups({ brainHome, now: now() });
+        }
+        catch {
+            // Retention is best effort; the files are already written. The SessionStart pass retries.
+        }
+    }
+    return result;
 }
 function changedSincePreview(path) {
     return new Error(`Refusing to overwrite ${path}: it changed after the preview. Re-run the command and review the new diff.`);

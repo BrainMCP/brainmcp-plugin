@@ -59,7 +59,10 @@ export function removeTomlBlock(existing) {
     const existingStart = managedStarts(existing, 'toml')[0];
     if (!existingStart)
         return existing;
-    const result = existing.replace(new RegExp(`\\n?${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}\\n?`), '').replace(/\n{3,}/g, '\n\n');
+    // CRLF line breaks go whole: a bare `\r` left behind is invalid TOML.
+    const result = existing
+        .replace(new RegExp(`(?:\\r?\\n)?${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}(?:\\r?\\n)?`), '')
+        .replace(/(\r?\n){3,}/g, '$1$1');
     return result.trim() ? result : undefined;
 }
 function managedStarts(text, format) {
@@ -226,20 +229,39 @@ function replaceTomlBrainTables(current, block) {
     const ranges = splitTomlSections(current).filter((section) => section.name === 'mcp_servers.brain' || section.name.startsWith('mcp_servers.brain.'));
     const mergedRanges = ranges.reduce((merged, range) => {
         const previous = merged.at(-1);
+        const contentEnd = tomlSectionContentEnd(current, range);
         if (previous && range.start <= previous.end) {
             previous.end = Math.max(previous.end, range.end);
+            previous.contentEnd = contentEnd;
         }
         else {
-            merged.push({ start: range.start, end: range.end });
+            merged.push({ start: range.start, end: range.end, contentEnd });
         }
         return merged;
     }, []);
     let repaired = current;
+    // Comment and blank lines that lead into the next, unrelated header belong to it.
     for (const range of mergedRanges.reverse()) {
-        repaired = `${repaired.slice(0, range.start)}${repaired.slice(range.end)}`;
+        repaired = `${repaired.slice(0, range.start)}${repaired.slice(range.contentEnd)}`;
     }
     repaired = repaired.replace(/\n{3,}/g, '\n\n').trimEnd();
     return `${repaired}${repaired ? '\n\n' : ''}${block}`;
+}
+/**
+ * Where a section's own lines end: before the first comment in its trailing
+ * run of comment and blank lines, which leads into the next header. The header
+ * line itself always counts as the section's.
+ */
+function tomlSectionContentEnd(current, section) {
+    const lines = current.slice(section.start, section.end).split(/(?<=\n)/);
+    let end = section.end;
+    let contentEnd = section.end;
+    for (let index = lines.length - 1; index > 0 && /^[\t ]*(?:#.*)?\r?\n?$/.test(lines[index]); index -= 1) {
+        end -= lines[index].length;
+        if (lines[index].trimStart().startsWith('#'))
+            contentEnd = end;
+    }
+    return contentEnd;
 }
 /** Adds a server without reformatting existing JSONC comments or sibling entries. */
 function insertJsonServer(source, server, rootKey) {
@@ -254,9 +276,37 @@ function insertJsonServer(source, server, rootKey) {
     const rendered = `"brain": ${JSON.stringify(server, null, 2).replace(/\n/g, `\n${entryIndent}`)}`;
     if (!inner.trim())
         return `${source.slice(0, open + 1)}\n${entryIndent}${rendered}\n${baseIndent}${source.slice(close)}`;
-    const end = open + 1 + inner.search(/\s*$/);
-    const comma = source.slice(open + 1, end).trimEnd().endsWith(',') ? '' : ',';
-    return `${source.slice(0, end)}${comma}\n${entryIndent}${rendered}${source.slice(end)}`;
+    return appendObjectEntry(source, open, close, entryIndent, rendered);
+}
+/**
+ * Appends `rendered` after the last entry of an object that is not blank. The
+ * separating comma goes right after the last value, so a trailing `// comment`
+ * keeps its place instead of swallowing the comma; the entry itself starts on a
+ * new line after that comment.
+ */
+function appendObjectEntry(source, open, close, entryIndent, rendered) {
+    const contentEnd = open + 1 + source.slice(open + 1, close).search(/\s*$/);
+    const valueEnd = lastTokenEnd(source, open, close);
+    // An object holding only comments has no value to separate from.
+    const commaAt = valueEnd < 0 ? contentEnd : valueEnd;
+    const comma = valueEnd < 0 || source[valueEnd - 1] === ',' ? '' : ',';
+    return `${source.slice(0, commaAt)}${comma}${source.slice(commaAt, contentEnd)}\n${entryIndent}${rendered}${source.slice(contentEnd)}`;
+}
+/** The offset just past an object's last value token or comma, skipping comments; -1 when it holds none. */
+function lastTokenEnd(source, open, close) {
+    let end = -1;
+    let index = skipJsoncTrivia(source, open + 1, close);
+    while (index < close) {
+        const character = source[index];
+        index = character === '"'
+            ? jsonStringEnd(source, index) + 1
+            : character === '{'
+                ? matchingBrace(source, index) + 1
+                : character === '[' ? matchingBracket(source, index) + 1 : index + 1;
+        end = index;
+        index = skipJsoncTrivia(source, index, close);
+    }
+    return end;
 }
 /** Adds a missing top-level server map without reformatting unrelated app state or JSONC comments. */
 function insertJsonRootMap(source, rootKey, value) {
@@ -271,9 +321,7 @@ function insertJsonRootMap(source, rootKey, value) {
     if (!inner.trim()) {
         return `${source.slice(0, open + 1)}\n${entryIndent}${rendered}\n${source.slice(close)}`;
     }
-    const end = open + 1 + inner.search(/\s*$/);
-    const comma = source.slice(open + 1, end).trimEnd().endsWith(',') ? '' : ',';
-    return `${source.slice(0, end)}${comma}\n${entryIndent}${rendered}${source.slice(end)}`;
+    return appendObjectEntry(source, open, close, entryIndent, rendered);
 }
 /** Finds any JSON-valued property at the current object's top level. */
 function findObjectProperty(source, objectOpen, propertyName) {
@@ -328,9 +376,7 @@ function insertJsonObjectProperty(source, objectOpen, propertyName, value) {
     if (!inner.trim()) {
         return `${source.slice(0, objectOpen + 1)}\n${entryIndent}${rendered}\n${baseIndent}${source.slice(close)}`;
     }
-    const end = objectOpen + 1 + inner.search(/\s*$/);
-    const comma = source.slice(objectOpen + 1, end).trimEnd().endsWith(',') ? '' : ',';
-    return `${source.slice(0, end)}${comma}\n${entryIndent}${rendered}${source.slice(end)}`;
+    return appendObjectEntry(source, objectOpen, close, entryIndent, rendered);
 }
 /** Finds an object-valued property at the current object's top level, ignoring strings/comments. */
 function findObjectPropertyObject(source, objectOpen, propertyName) {
@@ -357,6 +403,12 @@ function removeObjectProperty(source, objectOpen, propertyName) {
     }
     const previousComma = previousTopLevelComma(source, objectOpen, property.keyStart);
     if (previousComma >= 0) {
+        // A comment between that comma and the key belongs to the previous entry:
+        // drop only the comma and the property, not the text between them.
+        if (/\S/.test(source.slice(previousComma + 1, property.keyStart))) {
+            const cut = removeSpan(source, property.keyStart, property.valueEnd + 1);
+            return `${cut.slice(0, previousComma)}${cut.slice(previousComma + 1)}`;
+        }
         return `${source.slice(0, previousComma)}${source.slice(property.valueEnd + 1)}`;
     }
     return removeSpan(source, property.keyStart, property.valueEnd + 1);

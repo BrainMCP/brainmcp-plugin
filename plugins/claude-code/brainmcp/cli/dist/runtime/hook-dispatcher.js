@@ -4,10 +4,10 @@ import { filterRelativePaths } from '../lib/cli-contracts.js';
 import { emitHostOutput } from '../hooks/adapters.js';
 import { markSessionNudged, queueSessionCapture, recordSessionEvent } from './session.js';
 import { logRuntimeEvent } from './diagnostics.js';
-import { readPreferences, resolveStateDir } from './storage.js';
+import { getBrainHome, readPreferences, resolveStateDir } from './storage.js';
 import { pruneLocalState } from './retention.js';
 import { withRequestDeadline } from '../lib/http.js';
-import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, queueProjectRoots, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
+import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, captureConsentActive, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, queueProjectRoots, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
 import { canEnqueueCapture } from './flush.js';
 import { readTranscriptSummary } from './transcript-summary.js';
 import { isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
@@ -340,7 +340,8 @@ export async function dispatchHookEvent(event, options) {
             captureDisabled: policies.some((policy) => policy.captureDisabled) || projectBindingBlocksCapture(roots, prefs?.enabledWorkspaceId),
             promptsDisabled: policies.some((policy) => policy.promptsDisabled),
         };
-        const captureRuntimeEnabled = Boolean(prefs?.consent?.captureEnabled && !projectPolicy.captureDisabled);
+        // Consent to an earlier capture policy pauses capture (doctor says how to re-consent).
+        const captureRuntimeEnabled = Boolean(captureConsentActive(prefs) && !projectPolicy.captureDisabled);
         // Content needs the complete capture policy: a project opt-out stops prompt
         // text too, so a nudge ledger recorded under it stays content-free and a
         // later re-enable in the same session cannot send what was typed meanwhile.
@@ -414,8 +415,9 @@ export async function dispatchHookEvent(event, options) {
         const transcriptSummary = captureRuntimeEnabled && captureTriggerForEvent(event.event) && event.transcriptPath
             ? hostTranscriptSummary(event, options.baseDir)
             : undefined;
+        // options.baseDir is the account state directory by now; backups live in the brain home.
         if (isSessionStartEvent(event.event))
-            pruneLocalState({ baseDir: options.baseDir });
+            pruneLocalState({ baseDir: options.baseDir, brainHome: credentialOptions?.baseDir ?? getBrainHome() });
         const ledger = await recordSessionEvent({
             sessionKey: event.sessionKey,
             baseDir: options?.baseDir,
@@ -513,11 +515,17 @@ export async function dispatchHookEvent(event, options) {
             isCaptureEligible(event.event, prefs, projectPolicy) &&
             hasUncapturedMeaningfulSlice) {
             const workspaceId = resolveCaptureWorkspaceId(prefs);
+            const projectRoots = queueProjectRoots(roots);
             if (!workspaceId) {
                 logRuntimeEvent('warn', 'capture_workspace_unresolved', {
                     event: event.event,
                     sessionKey: event.sessionKey,
                 }, options?.baseDir);
+            }
+            else if (!projectRoots) {
+                // Every root's policy is rechecked at send time, so a root the queue
+                // item cannot record must not be captured at all.
+                logRuntimeEvent('warn', 'capture_project_roots_unrecordable', { event: event.event, sessionKey: event.sessionKey, roots: roots.length }, options?.baseDir);
             }
             else if (!canEnqueueCapture(options?.baseDir)) {
                 logRuntimeEvent('warn', 'capture_queue_capped', { event: event.event, sessionKey: event.sessionKey }, options?.baseDir);
@@ -568,7 +576,7 @@ export async function dispatchHookEvent(event, options) {
                                 digestText: serializeDigestPayload(payload),
                                 authorizationId: creds.authorizationId,
                                 consentRevision: prefs?.consent?.revision ?? 0,
-                                projectRoots: queueProjectRoots(roots),
+                                projectRoots,
                             },
                         });
                         // Log the slice's derived queue ID, and only when this slice has an item.
@@ -596,7 +604,7 @@ export async function dispatchHookEvent(event, options) {
             creds.scopes.includes('digests:write');
         // A digest POST does not fit a hook's budget, so hooks never send: they
         // start a detached process that delivers after this hook returns.
-        const allowAutomatic = prefs?.consent?.captureEnabled === true && !projectPolicy.captureDisabled;
+        const allowAutomatic = captureConsentActive(prefs) && !projectPolicy.captureDisabled;
         if (canFlush && allowAutomatic && options?.startBackgroundFlush && !controller.signal.aborted) {
             await options.startBackgroundFlush({ baseDir: options.baseDir }).catch((error) => {
                 logRuntimeEvent('warn', 'capture_background_flush_start_failed', { event: event.event, error: dispatchFailureClass(error, controller.signal.aborted) }, options?.baseDir);

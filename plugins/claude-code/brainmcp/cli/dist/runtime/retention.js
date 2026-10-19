@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getBrainHome, assertNotSymlink, resolveStateDir } from './storage.js';
 import { listQueueItems, removeQueueItem } from './queue.js';
-import { isProcessAlive } from './lock.js';
+import { isProcessAlive, removeLockIfStill } from './lock.js';
 import { logRuntimeEvent } from './diagnostics.js';
+import { pruneBackups } from '../lib/backups.js';
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 const FIVE_MB_BYTES = 5 * 1024 * 1024;
@@ -62,11 +63,13 @@ export function purgeCaptureLocalState(baseDir) {
     return removed;
 }
 /**
- * Safely prunes expired queue items, old session ledgers, stale locks, and trims logs (AHI-058).
+ * Safely prunes expired queue items, old session ledgers, stale locks, and
+ * configuration backups, and trims logs (AHI-058).
  * Never touches active credentials or installed runtime files.
  */
 export function pruneLocalState(options) {
-    const baseDir = resolveStateDir(options?.baseDir ?? getBrainHome());
+    const brainHome = options?.brainHome ?? options?.baseDir ?? getBrainHome();
+    const baseDir = resolveStateDir(options?.baseDir ?? brainHome);
     const now = options?.now ?? Date.now();
     const maxQueueAge = options?.maxQueueAgeMs ?? SEVEN_DAYS_MS;
     const maxSessionAge = options?.maxSessionAgeMs ?? FOURTEEN_DAYS_MS;
@@ -137,20 +140,40 @@ export function pruneLocalState(options) {
             assertNotSymlink(locksDir);
             const lockFiles = fs.readdirSync(locksDir);
             for (const file of lockFiles) {
+                const filePath = path.join(locksDir, file);
+                if (file.endsWith('.tmp')) {
+                    // A takeover's pending lock is renamed into place within a few file operations, so an
+                    // old one was left by a crash (see lock.ts).
+                    try {
+                        const stat = fs.lstatSync(filePath);
+                        if (!stat.isSymbolicLink() && now - stat.mtimeMs > 60 * 1000)
+                            fs.unlinkSync(filePath);
+                    }
+                    catch {
+                        // Ignore
+                    }
+                    continue;
+                }
                 if (!file.endsWith('.lock'))
                     continue;
-                const filePath = path.join(locksDir, file);
                 try {
                     const stat = fs.lstatSync(filePath);
-                    if (!stat.isSymbolicLink() && now - stat.mtimeMs > 60 * 1000) {
+                    if (stat.isSymbolicLink() || now - stat.mtimeMs <= 60 * 1000)
+                        continue;
+                    // Judged again under the lock's takeover guard: a takeover may have replaced the lock read
+                    // here with a live one, which a plain unlink would remove (review L8).
+                    const pruned = removeLockIfStill(filePath, (text, mtimeMs) => {
+                        if (now - mtimeMs <= 60 * 1000)
+                            return false;
                         try {
-                            if (isProcessAlive(JSON.parse(fs.readFileSync(filePath, 'utf8')).pid))
-                                continue;
+                            return !isProcessAlive(JSON.parse(text).pid);
                         }
-                        catch { /* Old malformed locks have no owner to protect. */ }
-                        fs.unlinkSync(filePath);
+                        catch {
+                            return true; // Old malformed locks have no owner to protect.
+                        }
+                    });
+                    if (pruned)
                         prunedLockCount += 1;
-                    }
                 }
                 catch {
                     // Ignore
@@ -161,7 +184,15 @@ export function pruneLocalState(options) {
             // Ignore
         }
     }
-    // 4. Rotate the runtime log if it exceeds the size limit
+    // 4. Prune configuration backups. They belong to the brain home, not an account.
+    let prunedBackupCount = 0;
+    try {
+        prunedBackupCount = pruneBackups({ brainHome, now });
+    }
+    catch {
+        // Ignore
+    }
+    // 5. Rotate the runtime log if it exceeds the size limit
     const logFile = path.join(baseDir, 'logs', 'runtime.log');
     if (fs.existsSync(logFile)) {
         try {
@@ -176,6 +207,7 @@ export function pruneLocalState(options) {
         prunedUndelivered,
         prunedSessionCount,
         prunedLockCount,
+        prunedBackupCount,
         logRotated,
     };
 }

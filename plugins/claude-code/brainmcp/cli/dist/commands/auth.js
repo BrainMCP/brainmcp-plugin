@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { stdin } from 'node:process';
 import { BRAINMCP_CLI_CLIENT_ID, BRAINMCP_CLI_DEFAULT_SCOPES, } from '../agent-config.js';
@@ -10,10 +11,12 @@ import { createDefaultCredentialStore, MemoryCredentialStore } from '../lib/cred
 import { grantedCliScopes, OAuthClient } from '../lib/oauth-client.js';
 export { grantedCliScopes } from '../lib/oauth-client.js';
 import { generatePkce } from '../lib/pkce.js';
-import { enableCapture, disableCapture } from '../runtime/capture.js';
+import { CAPTURE_DISCLOSURE, captureConsentOutdated, captureReconsentCommand, enableCapture, disableCapture } from '../runtime/capture.js';
 import { migrateLegacyFlatState, switchCurrentAccount, clearCurrentAccount, getBrainHome, getCurrentAccountId, readPreferences, resolveStateDir, sanitizeAccountId, SERVICE_ACCOUNT_ID, } from '../runtime/storage.js';
 import { clearOrientCache } from '../runtime/orient.js';
 import { withSessionLock } from '../runtime/lock.js';
+import { checkRuntimeDrift } from '../runtime/doctor-checks.js';
+import { cliPackageVersion } from '../runtime/installer.js';
 const MAX_SERVICE_TOKEN_STDIN_BYTES = 64 * 1024;
 /**
  * The workspace allowlist and default to store for a companion login. The
@@ -48,23 +51,40 @@ export function resolveCompanionWorkspaceGrant(listed) {
         return { workspaces: ids, defaultWorkspaceId: ids[0] };
     throw new Error('The OAuth server did not return a default workspace for this multi-workspace CLI grant. Run `brainmcp login` again (with `--force` if already signed in) and choose a default workspace in the browser.');
 }
-async function resolveStore(store, allowFileCredentials, baseDir) {
+async function resolveStore(store, allowFileCredentials, baseDir, fileFallbackOnVaultFailure) {
     if (store)
         return { store, backend: 'memory' };
     return createDefaultCredentialStore({
         baseDir,
         allowFileCredentials,
         persistFileAcknowledgement: allowFileCredentials,
+        fileFallbackOnVaultFailure,
     });
 }
-async function defaultOpenBrowser(url) {
-    const command = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-    const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+/**
+ * The command that hands `url` to the system browser. Windows uses rundll32,
+ * not `cmd /c start`: cmd splits its command line at `&`, which cut the
+ * authorize URL off after its first query parameter.
+ */
+export function browserOpenCommand(url, platform = process.platform) {
+    if (platform === 'darwin')
+        return { command: 'open', args: [url] };
+    if (platform === 'win32')
+        return { command: 'rundll32', args: ['url.dll,FileProtocolHandler', url] };
+    return { command: 'xdg-open', args: [url] };
+}
+/**
+ * Settles once the opener has started, not when it exits: `xdg-open` can keep
+ * running as long as the browser it launched, and login would wait on it.
+ * `spawnProcess` exists so tests need not open a browser.
+ */
+export async function defaultOpenBrowser(url, platform = process.platform, spawnProcess = spawn) {
+    const { command, args } = browserOpenCommand(url, platform);
     return await new Promise((resolve) => {
-        const child = spawn(command, args, { stdio: 'ignore', detached: true });
+        const child = spawnProcess(command, args, { stdio: 'ignore', detached: true });
+        child.once('error', () => resolve(false));
+        child.once('spawn', () => resolve(true));
         child.unref();
-        child.on('error', () => resolve(false));
-        child.on('close', (code) => resolve(code === 0));
     });
 }
 async function readStdinServiceToken() {
@@ -123,6 +143,24 @@ export async function commitCompanionCredentials(input) {
     else
         await commit();
 }
+/**
+ * Hooks installed by `brainmcp init` run the runtime it installed until init
+ * reruns, so after a sign-in say when that runtime is not this CLI's (the
+ * same check `doctor` reports as runtime drift).
+ */
+export function warnOnHookRuntimeDrift(home, warn) {
+    if (!home || !fs.existsSync(path.join(home, 'runtime')))
+        return;
+    try {
+        const drift = checkRuntimeDrift(cliPackageVersion(), home);
+        if (!drift.passed) {
+            warn(`Note: ${drift.detail}. Lifecycle hooks installed by \`brainmcp init\` keep running that runtime, which may not read this sign-in correctly; run \`brainmcp init\` to update them (\`brainmcp doctor\` shows which runtime hooks use).`);
+        }
+    }
+    catch {
+        // Advisory only; `doctor` reports an unreadable runtime directory.
+    }
+}
 function companionRuntimeHome(options) {
     const home = options.runtimeHome ?? process.env.BRAINMCP_HOME ?? process.env.BRAIN_HOME;
     if (home)
@@ -139,7 +177,7 @@ export async function login(options = {}) {
     }
     const { store } = options.serviceTokenStdin && !options.storeServiceToken
         ? { store: options.store ?? new MemoryCredentialStore() }
-        : await resolveStore(options.store, options.allowFileCredentials, options.runtimeHome);
+        : await resolveStore(options.store, options.allowFileCredentials, options.runtimeHome, options.allowFileCredentials);
     const oauthClient = options.oauthClient ?? new OAuthClient();
     if (options.serviceTokenStdin) {
         if (options.captureDigests) {
@@ -170,6 +208,8 @@ export async function login(options = {}) {
             clientId: 'service-token',
             scopes: [],
         };
+        if (options.storeServiceToken)
+            warnOnHookRuntimeDrift(companionRuntimeHome(options), options.json ? errorOutput : output);
         if (options.json) {
             output(JSON.stringify(envelope, null, 2));
         }
@@ -181,20 +221,34 @@ export async function login(options = {}) {
         return;
     }
     const existing = await store.get();
-    if (existing && !options.force && !existing.reauthRequired) {
-        throw new Error('Already authenticated. Pass --force to replace the stored companion credentials.');
+    // `login --capture-digests` on a sign-in that lacks digests:write is the
+    // documented way to add capture, so it re-authorizes for the added scope
+    // instead of demanding --force (through 0.1.38 it refused).
+    const addsDigestScope = Boolean(options.captureDigests && existing?.authType === 'oauth' &&
+        !existing.scopes?.includes('digests:write'));
+    if (existing && !options.force && !existing.reauthRequired && !addsDigestScope) {
+        throw new Error(!options.captureDigests
+            ? 'Already authenticated. Pass --force to replace the stored companion credentials.'
+            : existing.authType === 'service'
+                // A service token has no OAuth scopes and can never capture digests.
+                ? 'Signed in with a stored service token, which cannot capture digests. Pass --force (`brainmcp login --capture-digests --force`) to replace it with an interactive sign-in that includes digest capture (digests:write).'
+                : 'Already authenticated with digest capture (digests:write). Run `brainmcp capture enable` to turn capture on, or pass --force (`brainmcp login --capture-digests --force`) to sign in again.');
     }
+    const force = options.force || addsDigestScope;
     const scopes = [...BRAINMCP_CLI_DEFAULT_SCOPES];
     if (options.captureDigests) {
         scopes.push('digests:write');
     }
     const pkce = generatePkce();
+    // Discovery first: the callback checks the response's `iss` against the
+    // discovered issuer (RFC 9207).
+    const endpoints = await oauthClient.discoverEndpoints();
     const callbackServer = await startCallbackServer({
+        expectedIssuer: endpoints.issuer,
         expectedState: pkce.state,
         timeoutMs: 300_000,
     });
     try {
-        const endpoints = await oauthClient.discoverEndpoints();
         const authUrl = oauthClient.buildAuthorizationUrl({
             authorizationEndpoint: endpoints.authorizationEndpoint,
             redirectUri: callbackServer.redirectUri,
@@ -202,8 +256,11 @@ export async function login(options = {}) {
             scopes,
         });
         const humanOutput = options.json ? errorOutput : output;
+        if (addsDigestScope) {
+            humanOutput('You are signed in without digest capture; re-authorizing to add the digests:write scope. Your current sign-in stays until the new one completes.');
+        }
         if (options.captureDigests) {
-            humanOutput('Digest capture will upload bounded host/model labels, Git metadata, relative edited paths, and stable assistant summaries to Brain. Prompts, transcripts, file contents, and tool payloads are excluded. Disable with `brainmcp capture disable`.');
+            humanOutput(CAPTURE_DISCLOSURE);
         }
         humanOutput('Opening browser to authenticate with BrainMCP:');
         humanOutput(`  ${authUrl}`);
@@ -265,7 +322,7 @@ export async function login(options = {}) {
         if (listed.account.scopes) {
             credentialsRecord.scopes = grantedCliScopes(scopes, listed.account.scopes.join(' '));
         }
-        await commitCompanionCredentials({ home, store, credentials: credentialsRecord, force: options.force,
+        await commitCompanionCredentials({ home, store, credentials: credentialsRecord, force,
             captureWorkspaceId: options.captureDigests && credentialsRecord.scopes?.includes('digests:write')
                 ? credentialsRecord.defaultWorkspaceId ?? undefined : undefined });
         const responseEnvelope = {
@@ -287,6 +344,7 @@ export async function login(options = {}) {
             output('  This companion grant is for CLI hooks and orientation only.');
             output('  Host agents still need their own MCP OAuth (for Cursor: Settings → Tools & MCP → brain).');
         }
+        warnOnHookRuntimeDrift(home, humanOutput);
     }
     finally {
         await callbackServer.close().catch(() => { });
@@ -301,15 +359,28 @@ export async function logout(options = {}) {
     const stateDir = home ? resolveStateDir(home) : null;
     const current = await store.get();
     if (!current) {
+        // An earlier logout removed the marker but the OS vault refused to delete
+        // its copy (CredentialClearError): finish it, along with the local reset
+        // that logout skipped. A vault that still refuses throws the same error.
+        // (retryPendingClear deletes only while no marker, so no new sign-in, exists.)
+        const finished = Boolean(await store.retryPendingClear?.());
+        if (finished) {
+            if (stateDir)
+                resetCompanionLocalState(stateDir);
+            if (home && getCurrentAccountId(home) === accountId)
+                clearCurrentAccount(home);
+        }
         const res = {
             status: 'logged_out',
-            clearedCredentials: false,
+            clearedCredentials: finished,
         };
         if (options.json) {
             output(JSON.stringify(res, null, 2));
         }
         else {
-            output('Not currently logged in.');
+            output(finished
+                ? '✓ Finished the earlier logout: removed the sign-in the OS credential vault had kept.'
+                : 'Not currently logged in.');
         }
         return;
     }
@@ -333,6 +404,9 @@ export async function logout(options = {}) {
     const clearedCredentials = await store.withRefreshLock(async (latest) => {
         if (!latest || latest.userId !== current.userId || latest.authorizationId !== current.authorizationId || latest.authType !== current.authType)
             return false;
+        // A vault that refuses the delete throws CredentialClearError: the local
+        // marker is gone (nothing reads the grant), the account stays selected so
+        // the next `brainmcp logout` finds and retries the pending delete.
         await store.clear();
         if (stateDir)
             resetCompanionLocalState(stateDir);
@@ -398,7 +472,9 @@ export async function whoami(options = {}) {
     }
     else {
         output(reauthRequired
-            ? 'Status: Sign-in expired or revoked. Run `brainmcp login` to sign in again.'
+            ? creds.reauthRequired?.reason === 'credentials_incomplete'
+                ? `Status: Stored sign-in is incomplete (${creds.reauthRequired.detail}). Run \`brainmcp login\` to sign in again.`
+                : 'Status: Sign-in expired or revoked. Run `brainmcp login` to sign in again.'
             : `Status: Authenticated (${creds.authType})`);
         if (responseEnvelope.clientId) {
             output(`Client: ${responseEnvelope.clientId}`);
@@ -418,7 +494,9 @@ export async function whoami(options = {}) {
         if (responseEnvelope.expiresAt) {
             output(`Expires: ${responseEnvelope.expiresAt}`);
         }
-        output(`Capture: ${responseEnvelope.captureEnabled ? 'enabled' : 'disabled'}`);
+        output(`Capture: ${captureConsentOutdated(prefs)
+            ? `paused (the capture policy changed; run \`${captureReconsentCommand(prefs)}\` to accept it)`
+            : responseEnvelope.captureEnabled ? 'enabled' : 'disabled'}`);
         if (responseEnvelope.provenance) {
             output(`Consent Mode: ${responseEnvelope.provenance.consentMode} (${responseEnvelope.provenance.workspaceSelection})`);
         }

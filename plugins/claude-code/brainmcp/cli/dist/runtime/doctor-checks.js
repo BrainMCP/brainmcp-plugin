@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { validatePreferencesRecord } from '../lib/cli-contracts.js';
 import { DIGEST_CAP_ERROR_CODE, queueItemFailureClass } from './flush.js';
-import { describeCredentialsError, parseStoredCredentials } from '../lib/credentials.js';
+import { describeCredentialsError, parseStoredCredentials, readVaultMarker, readVaultRecord, validateStoredCredentials } from '../lib/credentials.js';
 import { getBrainHome, getCurrentAccountId, readSafeJson, resolveStateDir } from './storage.js';
 import { listInstalledRuntimes, readRuntimeShimTarget } from './installer.js';
 import { listQueueItems } from './queue.js';
+import { CAPTURE_POLICY_VERSION } from '../agent-config.js';
+import { captureConsentOutdated, captureReconsentCommand } from './capture.js';
 import { createPlatformVault, LEGACY_VAULT_ACCOUNT, vaultAccountKey } from '../lib/vault.js';
 import { describeMisdirectedCompanionApi, resolveCompanionApiUrl } from '../lib/endpoints.js';
 export async function checkCredentialHealth(baseDir, options) {
@@ -25,8 +27,19 @@ export async function checkCredentialHealth(baseDir, options) {
                 const raw = await vault.getSecret(accountId ? vaultAccountKey(accountId) : LEGACY_VAULT_ACCOUNT);
                 if (raw) {
                     let credentials;
+                    let markerError;
                     try {
-                        credentials = parseStoredCredentials(raw);
+                        const read = readVaultRecord(raw, backendMarker);
+                        if (read.kind === 'incomplete') {
+                            return {
+                                name: 'credential health',
+                                passed: false,
+                                detail: `OS vault grant is incomplete: ${read.detail}`,
+                                repairGuidance: 'Fix the marker file\'s mode (600) and owner if that is the cause, or run "brainmcp login --force" to sign in again',
+                            };
+                        }
+                        credentials = validateStoredCredentials(read.record);
+                        markerError = read.markerError;
                     }
                     catch (error) {
                         return {
@@ -36,7 +49,10 @@ export async function checkCredentialHealth(baseDir, options) {
                             repairGuidance: 'Run "brainmcp login --force" to recreate credentials',
                         };
                     }
-                    return storedCredentialHealth(credentials, 'OS credential vault');
+                    const health = storedCredentialHealth(credentials, 'OS credential vault');
+                    // A whole vault record stands on its own, so the sign-in still works:
+                    // its health is reported as usual, with the marker as a warning.
+                    return markerError ? withUnreadableMarkerWarning(health, markerError) : health;
                 }
             }
         }
@@ -45,6 +61,9 @@ export async function checkCredentialHealth(baseDir, options) {
         }
     }
     if (markerPresent) {
+        const markerError = readVaultMarker(backendMarker).error;
+        if (markerError)
+            return unreadableMarkerHealth(markerError);
         return {
             name: 'credential health',
             passed: false,
@@ -57,6 +76,22 @@ export async function checkCredentialHealth(baseDir, options) {
         passed: true,
         detail: 'no credentials stored (run brainmcp login)',
         repairGuidance: 'Run "brainmcp login" to connect your agent to BrainMCP',
+    };
+}
+function unreadableMarkerHealth(error) {
+    return {
+        name: 'credential health',
+        passed: false,
+        detail: `credential marker unreadable (mode/owner): ${error}`,
+        repairGuidance: 'Make credentials.backend.json a regular file owned by you with mode 600 (chmod 600), or run "brainmcp login --force" to sign in again',
+    };
+}
+function withUnreadableMarkerWarning(health, error) {
+    const fixMarker = 'Make credentials.backend.json a regular file owned by you with mode 600 (chmod 600)';
+    return {
+        ...health,
+        detail: `${health.detail}; warning: credential marker unreadable (mode/owner): ${error}. The OS vault holds this whole sign-in, so it still works`,
+        repairGuidance: health.repairGuidance ? `${health.repairGuidance}; ${fixMarker}` : fixMarker,
     };
 }
 function storedCredentialHealth(credentials, location) {
@@ -174,6 +209,14 @@ export function checkConsentPreferences(baseDir) {
         }
         const capture = prefs.consent.captureEnabled ? 'enabled' : 'disabled';
         const prompts = prefs.consent.includePrompts ? 'with prompts' : 'no prompts';
+        if (captureConsentOutdated(prefs)) {
+            return {
+                name: 'capture consent',
+                passed: false,
+                detail: `capture paused: consent was given to capture policy ${prefs.consent.policyVersion}, but what capture uploads changed in policy ${CAPTURE_POLICY_VERSION}; nothing is recorded or sent until you accept it with "${captureReconsentCommand(prefs)}"${prefs.consent.includePrompts ? ' (--include-prompts keeps your prompt opt-in; without it prompts are no longer captured)' : ''}`,
+                repairGuidance: `Run "${captureReconsentCommand(prefs)}" to review and accept the current capture policy (or "brainmcp capture disable" to turn capture off)`,
+            };
+        }
         return {
             name: 'capture consent',
             passed: true,
@@ -231,11 +274,11 @@ const CAPTURE_QUEUE_CAUSES = {
     },
     non_retryable: {
         label: 'refused by the server',
-        fix: 'see lastError in the queue item; "brainmcp capture purge-local" clears it',
+        fix: 'see lastError in the queue item; the server will not accept it, and local retention removes it after 7 days',
     },
     retry_exhausted: {
         label: 'retries ran out (network or server errors)',
-        fix: '"brainmcp capture purge-local" clears it; later captures retry on their own',
+        fix: 'run "brainmcp capture now" (from any project) to requeue the ones from the current sign-in and capture workspace, including ones queued before a capture re-consent (one that carries prompts needs a consent that includes prompts) but never ones queued before a capture disable, which withdrew them; the server ignores a digest it already holds',
     },
     delivery_unknown: {
         label: 'delivery outcome unknown',
@@ -265,7 +308,9 @@ export function checkQueueStatus(baseDir) {
     try {
         const items = listQueueItems(baseDir);
         const pending = items.filter((i) => i.status === 'pending');
-        const failed = items.filter((i) => i.status === 'failed' || i.status === 'delivery_unknown');
+        const failed = items.filter((i) => i.status === 'failed');
+        // Not failures: retried like pending items (the server ignores a digest it already holds).
+        const unknown = items.filter((i) => i.status === 'delivery_unknown');
         if (items.length === 0) {
             return {
                 name: 'capture queue',
@@ -279,15 +324,37 @@ export function checkQueueStatus(baseDir) {
             if (cause)
                 counts.set(cause, (counts.get(cause) ?? 0) + 1);
         }
-        const causes = [...counts].map(([cause, count]) => `${count} × ${CAPTURE_QUEUE_CAUSES[cause].label}: ${CAPTURE_QUEUE_CAUSES[cause].fix}`);
+        let prefs = null;
+        try {
+            prefs = readSafeJson(path.join(resolveStateDir(baseDir), 'preferences.json'), validatePreferencesRecord);
+        }
+        catch {
+            // The capture consent check reports unreadable preferences.
+        }
+        // `capture now` requeues exhausted items only while capture is active, and
+        // only into the capture workspace (a send to another one is cancelled).
+        const exhaustedNotes = [];
+        if (counts.has('retry_exhausted')) {
+            if (captureConsentOutdated(prefs))
+                exhaustedNotes.push(`capture is paused, so run "${captureReconsentCommand(prefs)}" first`);
+            const elsewhere = prefs?.enabledWorkspaceId
+                ? items.filter((item) => captureQueueItemCause(item) === 'retry_exhausted' && item.workspaceId !== prefs.enabledWorkspaceId).length
+                : 0;
+            if (elsewhere > 0)
+                exhaustedNotes.push(`${elsewhere} belong to a workspace other than the capture workspace and cannot be resent (local retention removes them after 7 days)`);
+        }
+        const causes = [...counts].map(([cause, count]) => `${count} × ${CAPTURE_QUEUE_CAUSES[cause].label}: ${CAPTURE_QUEUE_CAUSES[cause].fix}${cause === 'retry_exhausted' && exhaustedNotes.length ? `; ${exhaustedNotes.join('; ')}` : ''}`);
         // Items waiting out the digest cap are not failures, but the cause needs action.
         const hasFailed = failed.length > 0 || counts.has('digest_cap');
         return {
             name: 'capture queue',
             passed: !hasFailed,
-            detail: `${pending.length} pending, ${failed.length} failed out of ${items.length} total${causes.length ? `; ${causes.join('; ')}` : ''}`,
+            detail: `${pending.length} pending, ${unknown.length ? `${unknown.length} delivery unknown (retried), ` : ''}${failed.length} failed out of ${items.length} total${causes.length ? `; ${causes.join('; ')}` : ''}`,
+            // Never `capture purge-local`: it deletes the pending items too.
             repairGuidance: failed.length > 0
-                ? 'Run "brainmcp capture purge-local" to clear failed items'
+                ? counts.has('retry_exhausted')
+                    ? `Run "brainmcp capture now" (from any project) to requeue items that ran out of retries${exhaustedNotes.length ? ` (${exhaustedNotes.join('; ')})` : ''}; fix any other cause listed above`
+                    : 'Fix the causes listed above; local retention removes failed items after 7 days'
                 : hasFailed ? `Have an agent process the workspace's pending digests; ${CAPTURE_QUEUE_CAUSES.digest_cap.label} clears then` : undefined,
         };
     }

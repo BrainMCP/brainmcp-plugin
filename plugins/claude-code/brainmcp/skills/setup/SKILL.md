@@ -16,8 +16,9 @@ Ask the user to run these in their own terminal. Each opens a browser consent pa
 
 - Sign in: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" login`
 - Check the install: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" doctor --client claude-code --scope user`
-- Opt in to session capture: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" login --capture-digests`, then `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" capture enable`
-- Capture status, opt out, or delete queued local data: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" capture status`, `capture disable`, `capture purge-local`
+- Opt in to session capture: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" login --capture-digests`. It asks for digest access (re-authorizing an existing sign-in that lacks it) and turns capture on for the grant's default workspace; add `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" capture enable --workspace <uuid>` only to capture into another workspace. After a capture policy change, `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" capture enable` accepts the new policy
+- Pin this repository to a workspace: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" bind --workspace <uuid>` from inside it (writes `.brainmcp.json` at the Git root; `bind` alone shows the binding, `unbind` removes it)
+- Capture status, opt out, or delete queued local data: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" capture status`, `capture disable`, `capture purge-local` (purge deletes captures still waiting for delivery too; `capture now` retries ones that ran out of retries)
 - Sign out: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" logout`
 
 Hooks need Node.js 22 or newer on PATH. Uninstalling the plugin leaves `~/.brainmcp` (sign-in, preferences, queue); sign out and purge first if the user wants it gone.

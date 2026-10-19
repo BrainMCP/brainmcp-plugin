@@ -597,6 +597,35 @@ export const WRITE_BACK_REMINDER = GRAPH_WRITE_GUIDANCE + ' ' + PROACTIVE_WRITE_
  * Cursor). Installs are keyed `brainmcp@<marketplace>`, so it must never change.
  */
 export const BRAINMCP_PLUGIN_NAME = 'brainmcp';
+/** Public repository every host installs the brainmcp plugins from. */
+export const BRAINMCP_PLUGIN_REPOSITORY = 'BrainMCP/brainmcp-plugin';
+export const BRAINMCP_PLUGIN_REPOSITORY_URL = `https://github.com/${BRAINMCP_PLUGIN_REPOSITORY}`;
+/** Marketplace name in every host. Installs are keyed `brainmcp@brainmcp`, so it must never change. */
+export const BRAINMCP_PLUGIN_MARKETPLACE_NAME = 'brainmcp';
+export const BRAINMCP_PLUGIN_ID = `${BRAINMCP_PLUGIN_NAME}@${BRAINMCP_PLUGIN_MARKETPLACE_NAME}`;
+export function buildBrainmcpPluginInstall(host) {
+    if (host === 'claude-code') {
+        return {
+            host,
+            installCommands: [
+                `claude plugin marketplace add ${BRAINMCP_PLUGIN_REPOSITORY}`,
+                `claude plugin install ${BRAINMCP_PLUGIN_ID}`,
+            ],
+            inSessionCommand: `/plugin install ${BRAINMCP_PLUGIN_NAME} --marketplace ${BRAINMCP_PLUGIN_REPOSITORY}`,
+            serverLabel: `plugin:${BRAINMCP_PLUGIN_NAME}:${BRAIN_MCP_SERVER_NAME}`,
+            updateCommand: `claude plugin update ${BRAINMCP_PLUGIN_ID}`,
+        };
+    }
+    return {
+        host,
+        installCommands: [
+            `codex plugin marketplace add ${BRAINMCP_PLUGIN_REPOSITORY}`,
+            `codex plugin add ${BRAINMCP_PLUGIN_ID}`,
+        ],
+        serverLabel: BRAIN_MCP_SERVER_NAME,
+        loginCommand: `codex mcp login ${BRAIN_MCP_SERVER_NAME}`,
+    };
+}
 export const AGENT_SKILL_NAME = 'using-brainmcp';
 export const AGENT_SKILL_DESCRIPTION = 'Use brain / brainmcp shared project memory: orient, pull context before work, follow Rules/Skills/Workflows, write durable learnings back as reviewable proposals, and save a Context Path only when asked for an explanation link.';
 export function buildAgentSkillMarkdown(options) {
@@ -959,7 +988,7 @@ export function buildServerInstructions() {
         '5. Do the work outside brain; apply the answer-grounding contract below before presenting conclusions.',
         '6. Write back — first apply learningSignals.recentDecisions. Use the audited proposal pipeline only for new durable project-specific graph learnings (reviewable proposals), and abstain when nothing reusable changed. Never store secrets, credentials, personal data, raw transcripts, or temporary build/log output. Exact duplicate creates can be blocked; update/reuse the matched item or wait for the existing pending proposal instead of retrying. Report the proposal id/status. brain_session_digest remains an explicitly user-requested disclosed fallback, not an automatic dump; brain_tags_set organizes via proposals; brain_comment_create leaves an immediate human note/report; brain_workflow_record_run records a due Workflow. To create and link new nodes in one proposal, pre-assign UUID targetIds and reference them from later operations.',
         '',
-        'CROSS-AGENT CLIPBOARD: brain_copy immediately stores the current relevant message/output (or something the user names) on an account-wide clipboard; brain_paste retrieves the latest clip or the last N (newest first, max 10). No workspaceId is required. Use this to move working context between agents or workspaces without manual copy/paste.',
+        'CROSS-AGENT CLIPBOARD: brain_copy immediately stores the current relevant message/output (or something the user names) on the clipboard; pass sourceWorkspaceId, the current workspace (one this connection is authorized for). brain_paste retrieves the latest clip or the last N (newest first, max 10), and shows only clips copied from workspaces this connection is authorized for; it needs no workspaceId. Use this to move working context between agents or workspaces without manual copy/paste.',
         '',
         `RETRIEVAL: ${CONTEXT_RETRIEVAL_GUIDANCE}`,
         `RECOVERY: ${CONTEXT_RECOVERY_GUIDANCE}`,
@@ -1010,8 +1039,8 @@ export function buildCanonicalWorkflowMarkdown(options) {
         '6. **Write back** — apply `learningSignals.recentDecisions`, then use the audited proposal pipeline only for new durable project-specific learnings. Never store secrets, personal data, raw transcripts, or temporary output. Report the proposal id/status and abstain when nothing reusable changed. Exact duplicate creates can be blocked; update/reuse the matched item or wait for its pending proposal. `brain_session_digest` remains an explicitly user-requested disclosed fallback; use tags/comments/workflow-run tools for their specific jobs.',
         '',
         '## Cross-agent clipboard',
-        '- `brain_copy` — immediately store the last relevant message/output (or something the user names) on the account clipboard.',
-        '- `brain_paste` — retrieve the latest clip or the last N (newest first, max 10). No `workspaceId` required.',
+        '- `brain_copy` — immediately store the last relevant message/output (or something the user names) on the clipboard. `sourceWorkspaceId` is required: the current workspace, one this connection is authorized for.',
+        '- `brain_paste` — retrieve the latest clip or the last N (newest first, max 10), limited to clips copied from workspaces this connection is authorized for. No `workspaceId` required.',
         '',
         '## Rules',
         `- ${EMPTY_WORKSPACE_RESPONSE_REQUIREMENT}`,
@@ -1081,7 +1110,7 @@ export function assertValidCliScopes(scopes) {
 export const ORIENT_CONTRACT_VERSION = '2026-10-04.orient-v2';
 export const ORIENT_MAX_QUERY_CHARS = 500;
 export const ORIENT_MAX_LOOKBACK_DAYS = 30;
-export const CAPTURE_POLICY_VERSION = '2026-09-02.capture-v1';
+export const CAPTURE_POLICY_VERSION = '2026-10-18.capture-v2';
 /** Map a capture trigger to the digest API spelling (`pre_compact` → `precompact`). */
 export function normalizeCaptureTrigger(trigger) {
     return (trigger === 'pre_compact' ? 'precompact' : trigger);

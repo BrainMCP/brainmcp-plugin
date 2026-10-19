@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { withSessionLock } from '../runtime/lock.js';
 import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { assertNotSymlink, ensureDirectory0700, getBrainHome, getCurrentAccountId, resolveStateDir, writeAtomic0600 } from '../runtime/storage.js';
-import { createPlatformVault, UnavailableSecretVault, vaultAccountKey, LEGACY_VAULT_ACCOUNT } from './vault.js';
+import { assertNotSymlink, ensureDirectory0700, getBrainHome, getCurrentAccountId, readSafeJson, resolveStateDir, writeAtomic0600 } from '../runtime/storage.js';
+import { createPlatformVault, UnavailableSecretVault, vaultAccountKey, LEGACY_VAULT_ACCOUNT, MACOS_SECURITY_MAX_LINE_BYTES, macosSecurityAddLine, VaultValueTooLargeError, } from './vault.js';
 import { CREDENTIALS_SCHEMA_VERSION, InvalidJsonError, parseJsonWithoutEcho } from './cli-contracts.js';
 /** A credentials record that cannot be used. The message never includes record contents. */
 export class InvalidCredentialsError extends Error {
@@ -92,6 +92,13 @@ export function describeCredentialsError(error) {
 }
 // unsafe-logging-allowed: callers pass only fixed text or describeCredentialsError output, never a record or token.
 const warnOnConsole = (message) => console.warn(`[brainmcp credentials] ${message}`);
+/** The OS vault refused to delete the sign-in; the local marker is gone, so it is no longer used. */
+export class CredentialClearError extends Error {
+    constructor() {
+        super('The local sign-in was removed, but the OS credential vault refused to delete its copy (is the keychain or keyring locked?). Unlock it and run `brainmcp logout` again to finish.');
+        this.name = 'CredentialClearError';
+    }
+}
 export class MemoryCredentialStore {
     creds = null;
     locked = false;
@@ -262,6 +269,139 @@ export class FileCredentialStore {
         return withSessionLock('credentials', () => this.lockContext.run(stateDir, async () => action(await this.get())), { baseDir: stateDir });
     }
 }
+/**
+ * The OS vault item normally holds the whole record, exactly as 0.1.38 and
+ * earlier wrote and read it: a hook runtime pinned to an older CLI (until
+ * `brainmcp init` reruns) reads the vault item alone. Only a record whose
+ * macOS `security -i` line would overflow (a grant with many workspaces, see
+ * vault.ts) is split: its tokens stay in the vault and everything else
+ * (workspaces, scopes, provenance, refresh lease, ...) goes to the owner-only
+ * backend marker file.
+ *
+ * A split item carries SPLIT_VAULT_FORMAT and no `version`, so an older
+ * runtime reads it as "no credentials" instead of a grant without identity
+ * that its next refresh would write back over the record.
+ */
+const SPLIT_VAULT_FORMAT = 'brainmcp.vault-split.v1';
+const VAULT_TOKEN_FIELDS = ['authType', 'accessToken', 'refreshToken', 'serviceToken'];
+/**
+ * Both halves of one split write carry the same random pair id, so a reader
+ * never joins a vault item with the marker half of another write.
+ */
+const SPLIT_PAIR_FIELD = 'splitPairId';
+/**
+ * A split record goes back to one whole vault item only once that item's
+ * `security -i` line is this far under the limit, so a record near the line
+ * (a refresh lease adds about 115 bytes) does not flip layouts every refresh.
+ */
+const WHOLE_LAYOUT_MAX_FRACTION = 0.9;
+export function splitVaultCredentials(credentials, pairId) {
+    const secret = { format: SPLIT_VAULT_FORMAT };
+    const metadata = {};
+    for (const [field, value] of Object.entries(credentials)) {
+        if (value === undefined)
+            continue;
+        if (VAULT_TOKEN_FIELDS.includes(field))
+            secret[field] = value;
+        else
+            metadata[field] = value;
+    }
+    if (pairId) {
+        secret[SPLIT_PAIR_FIELD] = pairId;
+        metadata[SPLIT_PAIR_FIELD] = pairId;
+    }
+    return { secret, metadata };
+}
+function metadataObject(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+/**
+ * The backend marker's split metadata (null when it has none), or why the
+ * marker could not be read (wrong mode or owner, not a regular file, corrupt JSON).
+ */
+export function readVaultMarker(markerPath) {
+    try {
+        const marker = metadataObject(readSafeJson(markerPath));
+        if (!marker)
+            return { metadata: null, previousMetadata: null };
+        const layout = marker.layout === 'whole' || marker.layout === 'split' ? marker.layout : undefined;
+        return { metadata: metadataObject(marker.metadata), previousMetadata: metadataObject(marker.previousMetadata), ...(layout ? { layout } : {}) };
+    }
+    catch (error) {
+        // readSafeJson's own messages name only the path, mode, and owner.
+        return { metadata: null, previousMetadata: null, error: error instanceof Error ? error.message : 'could not be read' };
+    }
+}
+/** Pre-fix development builds (never published) split with `version` and no `updatedAt` (every whole record has one). */
+function isSplitVaultItem(item) {
+    return item.format === SPLIT_VAULT_FORMAT || (item.version !== undefined && item.updatedAt === undefined);
+}
+/**
+ * The vault item read together with the backend marker. A whole record stands
+ * on its own (marker metadata, possibly stale, is ignored); a split item needs
+ * the marker's metadata. Throws InvalidJsonError for a corrupt vault item.
+ */
+export function readVaultRecord(raw, markerPath) {
+    const item = parseJsonWithoutEcho(raw, 'credentials');
+    const marker = readVaultMarker(markerPath);
+    if (!item || typeof item !== 'object' || Array.isArray(item))
+        return { kind: 'record', record: item, markerError: marker.error };
+    const secret = item;
+    if (!isSplitVaultItem(secret))
+        return { kind: 'record', record: secret, markerError: marker.error };
+    const incomplete = (detail, mismatch) => ({
+        kind: 'incomplete',
+        authType: secret.authType,
+        detail,
+        ...(nonEmptyString(secret.refreshToken) ? { refreshToken: secret.refreshToken } : {}),
+        ...(mismatch ? { mismatch } : {}),
+    });
+    if (marker.error) {
+        return incomplete(`credential marker unreadable (mode/owner): ${marker.error}. The OS vault holds only the tokens of this sign-in; its account, workspaces, and scopes are in that file`);
+    }
+    if (!marker.metadata) {
+        return incomplete('credential marker has no sign-in details (an older BrainMCP runtime rewrote it). The OS vault holds only the tokens of this sign-in; its account, workspaces, and scopes are gone');
+    }
+    // Both halves of one write (items and markers written before pair ids carry none).
+    const pairId = secret[SPLIT_PAIR_FIELD];
+    const metadata = [marker.metadata, marker.previousMetadata].find((candidate) => candidate && candidate[SPLIT_PAIR_FIELD] === pairId);
+    if (!metadata) {
+        return incomplete('credential marker belongs to another save of this sign-in than the OS vault item (another BrainMCP process was saving it, or that save failed half way)', true);
+    }
+    const merged = { ...metadata };
+    for (const field of [...VAULT_TOKEN_FIELDS, SPLIT_PAIR_FIELD])
+        delete merged[field];
+    const { format: _format, [SPLIT_PAIR_FIELD]: _pairId, ...tokens } = secret;
+    return { kind: 'record', record: { ...merged, ...tokens } };
+}
+function writeVaultMarker(markerPath, fields) {
+    ensureDirectory0700(dirname(markerPath));
+    const marker = { backend: 'os_vault', updatedAt: new Date().toISOString() };
+    if (fields.layout)
+        marker.layout = fields.layout;
+    if (fields.metadata)
+        marker.metadata = fields.metadata;
+    if (fields.previousMetadata)
+        marker.previousMetadata = fields.previousMetadata;
+    writeAtomic0600(markerPath, JSON.stringify(marker));
+}
+/** How long get() waits before re-reading a split item whose halves did not match. */
+const SPLIT_MISMATCH_RETRY_MS = 100;
+/**
+ * Names the vault key whose delete a clear() could not finish, beside the
+ * (already removed) marker, so the next logout retries it. Never a secret.
+ */
+const PENDING_VAULT_DELETE_FILENAME = 'credentials.vault-delete-pending.json';
+/** The marker as stored, to put back after a failed split write; null when it is absent or unreadable. */
+function readSafeJsonOrNull(path) {
+    try {
+        return readSafeJson(path);
+    }
+    catch {
+        return null;
+    }
+}
+const TOO_LARGE_FOR_VAULT = 'The credentials are too large for the OS credential vault; nothing was written and the stored sign-in is unchanged. Run `brainmcp login --force --allow-file-credentials` to store them in an owner-only ~/.brainmcp file (0700/0600, no symlinks).';
 export class VaultCredentialStore {
     vault;
     lockStore;
@@ -284,38 +424,189 @@ export class VaultCredentialStore {
         const accountId = getCurrentAccountId(this.baseDir ?? getBrainHome());
         return accountId ? vaultAccountKey(accountId) : LEGACY_VAULT_ACCOUNT;
     }
-    async get() {
-        // A fresh/isolated Brain home must not probe or adopt another home's
-        // machine-wide vault entry merely because it uses the same account key.
-        if (!existsSync(this.backendMarkerPath()))
-            return null;
-        assertNotSymlink(this.backendMarkerPath());
+    pendingDeletePath() {
+        return join(dirname(this.backendMarkerPath()), PENDING_VAULT_DELETE_FILENAME);
+    }
+    async readOnce(marker) {
         const raw = await this.vault.getSecret(this.secretKey());
         if (!raw)
             return null;
         try {
-            const parsed = parseJsonWithoutEcho(raw, 'credentials');
-            if (parsed?.version !== CREDENTIALS_SCHEMA_VERSION)
-                return null;
-            return parsed;
+            return readVaultRecord(raw, marker);
         }
         catch {
             return null;
         }
     }
+    async get() {
+        // A fresh/isolated Brain home must not probe or adopt another home's
+        // machine-wide vault entry merely because it uses the same account key.
+        const marker = this.backendMarkerPath();
+        if (!existsSync(marker))
+            return null;
+        assertNotSymlink(marker);
+        let read = await this.readOnce(marker);
+        if (read?.kind === 'incomplete' && read.mismatch) {
+            // A writer between its two halves (set() writes the marker first and
+            // keeps the previous half): read both again once it has finished.
+            await new Promise((resolve) => setTimeout(resolve, SPLIT_MISMATCH_RETRY_MS));
+            if (!existsSync(marker))
+                return null;
+            read = await this.readOnce(marker);
+        }
+        if (!read)
+            return null;
+        if (read.kind === 'incomplete') {
+            // Never a stripped grant: without its identity a refresh would write the
+            // tokens back as a record that no longer names its account or workspaces.
+            // The refresh token stays so logout can revoke it; reauthRequired blocks
+            // every request and refresh.
+            if (read.authType !== 'oauth')
+                return null;
+            const now = new Date().toISOString();
+            return {
+                version: CREDENTIALS_SCHEMA_VERSION,
+                authType: 'oauth',
+                ...(read.refreshToken ? { refreshToken: read.refreshToken } : {}),
+                reauthRequired: { reason: 'credentials_incomplete', detail: read.detail, detectedAt: now },
+                updatedAt: now,
+            };
+        }
+        const parsed = read.record;
+        if (parsed?.version !== CREDENTIALS_SCHEMA_VERSION)
+            return null;
+        return parsed;
+    }
+    /**
+     * The whole record in one vault item when it fits, so an older hook runtime
+     * (which reads the vault item alone) still reads it; else split, tokens in
+     * the vault and the rest in the marker. Concurrent readers (hooks) never see
+     * a split item without its half: a split write puts its half in the marker
+     * first and keeps the previous write's half beside it, and both halves carry
+     * one pair id. A whole write leaves the marker's split halves in place (a
+     * whole item ignores them) for a reader that read the earlier split item.
+     * Once split, the record stays split until the whole item would be at least
+     * 10% under the line limit, so a refresh lease does not flip the layout.
+     */
     async set(credentials) {
         const marker = this.backendMarkerPath();
-        await this.vault.setSecret(JSON.stringify(credentials), this.secretKey());
-        ensureDirectory0700(dirname(marker));
-        writeAtomic0600(marker, JSON.stringify({ backend: 'os_vault', updatedAt: new Date().toISOString() }));
+        const key = this.secretKey();
+        const before = readVaultMarker(marker);
+        const wasSplit = before.layout === 'split' || (before.layout === undefined && before.metadata !== null);
+        const whole = JSON.stringify(credentials);
+        const staySplit = wasSplit &&
+            Buffer.byteLength(macosSecurityAddLine(whole, key), 'utf8') > MACOS_SECURITY_MAX_LINE_BYTES * WHOLE_LAYOUT_MAX_FRACTION;
+        if (!staySplit) {
+            // The vault first: if it refuses (locked, ...) nothing changes.
+            let fits = true;
+            try {
+                await this.vault.setSecret(whole, key);
+            }
+            catch (error) {
+                if (!(error instanceof VaultValueTooLargeError))
+                    throw error;
+                fits = false;
+            }
+            if (fits) {
+                writeVaultMarker(marker, {
+                    layout: 'whole',
+                    // Halves an earlier split write left are kept only for a reader of that write.
+                    ...(wasSplit ? { metadata: before.metadata ?? undefined, previousMetadata: before.previousMetadata ?? undefined } : {}),
+                });
+                this.dropPendingDelete();
+                return;
+            }
+        }
+        const { secret, metadata } = splitVaultCredentials(credentials, randomUUID());
+        const markerExisted = existsSync(marker);
+        const restore = before.error ? null : readSafeJsonOrNull(marker);
+        writeVaultMarker(marker, { layout: 'split', metadata, previousMetadata: before.metadata ?? undefined });
+        try {
+            await this.vault.setSecret(JSON.stringify(secret), key);
+        }
+        catch (error) {
+            // The vault item is unchanged, so the marker goes back to what it was
+            // (none: get() must not start reading a vault item this home never wrote).
+            try {
+                if (!markerExisted)
+                    unlinkSync(marker);
+                else if (restore)
+                    writeAtomic0600(marker, JSON.stringify(restore));
+            }
+            catch {
+                // previousMetadata still pairs with the unchanged vault item.
+            }
+            if (error instanceof VaultValueTooLargeError)
+                throw new VaultValueTooLargeError(TOO_LARGE_FOR_VAULT);
+            throw error;
+        }
+        this.dropPendingDelete();
     }
+    dropPendingDelete() {
+        try {
+            const pending = this.pendingDeletePath();
+            if (existsSync(pending))
+                unlinkSync(pending);
+        }
+        catch {
+            // A stale record only makes the next signed-out logout delete this key again.
+        }
+    }
+    /**
+     * The marker first: it gates get(), so a vault delete that fails cannot
+     * leave a readable grant. That failure is recorded beside the marker and
+     * thrown as CredentialClearError, so the next logout (which finds no
+     * marker) retries the delete through retryPendingClear().
+     */
     async clear() {
         const marker = this.backendMarkerPath();
-        await this.vault.deleteSecret(this.secretKey());
-        if (existsSync(marker)) {
-            assertNotSymlink(marker);
-            unlinkSync(marker);
+        const key = this.secretKey();
+        try {
+            if (existsSync(marker)) {
+                assertNotSymlink(marker);
+                unlinkSync(marker);
+            }
         }
+        finally {
+            await this.deleteVaultItem(key);
+        }
+    }
+    async deleteVaultItem(key) {
+        try {
+            await this.vault.deleteSecret(key);
+        }
+        catch {
+            try {
+                writeAtomic0600(this.pendingDeletePath(), JSON.stringify({ key, recordedAt: new Date().toISOString() }));
+            }
+            catch {
+                // Reported below either way.
+            }
+            throw new CredentialClearError();
+        }
+        this.dropPendingDelete();
+    }
+    async retryPendingClear() {
+        const pendingPath = this.pendingDeletePath();
+        let key;
+        try {
+            key = metadataObject(readSafeJson(pendingPath))?.key;
+        }
+        catch {
+            return false;
+        }
+        // Only this home's own key: never another home's machine-wide item.
+        if (key !== this.secretKey()) {
+            this.dropPendingDelete();
+            return false;
+        }
+        if (existsSync(this.backendMarkerPath())) {
+            // A sign-in was saved since; logout clears it normally.
+            this.dropPendingDelete();
+            return false;
+        }
+        await this.deleteVaultItem(key);
+        return true;
     }
     async adoptLegacySecret() {
         const accountId = getCurrentAccountId(this.baseDir ?? getBrainHome());
@@ -329,11 +620,70 @@ export class VaultCredentialStore {
             return;
         await this.vault.setSecret(legacy, namespaced);
         await this.vault.deleteSecret(LEGACY_VAULT_ACCOUNT);
-        writeAtomic0600(this.backendMarkerPath(), JSON.stringify({ backend: 'os_vault', updatedAt: new Date().toISOString() }));
+        const marker = this.backendMarkerPath();
+        const current = readVaultMarker(marker);
+        writeVaultMarker(marker, {
+            ...(current.layout ? { layout: current.layout } : {}),
+            metadata: current.metadata ?? undefined,
+            previousMetadata: current.previousMetadata ?? undefined,
+        });
     }
     async withRefreshLock(action) {
         const context = { key: this.secretKey(), stateDir: resolveStateDir(this.baseDir ?? getBrainHome()) };
         return this.lockStore.withRefreshLock(() => this.lockContext.run(context, async () => action(await this.get())));
+    }
+}
+/**
+ * The OS vault, falling back to the owner-only file store when a vault write
+ * fails. Used only when the user passed `--allow-file-credentials`, so an
+ * available-but-failing vault (locked keychain, oversized record, ...) does not
+ * block sign-in. Once the file exists it is the backend for this home.
+ */
+export class VaultWithFileFallbackStore {
+    vaultStore;
+    fileStore;
+    baseDir;
+    warn;
+    constructor(vaultStore, fileStore, baseDir, warn) {
+        this.vaultStore = vaultStore;
+        this.fileStore = fileStore;
+        this.baseDir = baseDir;
+        this.warn = warn;
+    }
+    fileExists() {
+        return existsSync(join(resolveStateDir(this.baseDir ?? getBrainHome()), 'credentials.json'));
+    }
+    async get() {
+        return this.fileExists() ? this.fileStore.get() : this.vaultStore.get();
+    }
+    async set(credentials) {
+        if (this.fileExists())
+            return this.fileStore.set(credentials);
+        try {
+            await this.vaultStore.set(credentials);
+        }
+        catch {
+            this.warn('The OS credential vault refused the credentials; using the owner-only ~/.brainmcp file store (--allow-file-credentials).');
+            await this.fileStore.set(credentials);
+            // The file is now authoritative; drop the vault copy so the two cannot
+            // diverge. clear() removes the marker first, so even a failed vault
+            // delete leaves nothing a later run (after logout) would read.
+            await this.vaultStore.clear().catch(() => undefined);
+        }
+    }
+    async clear() {
+        await this.fileStore.clear();
+        await this.vaultStore.clear();
+    }
+    async retryPendingClear() {
+        return this.vaultStore.retryPendingClear();
+    }
+    async adoptLegacySecret() {
+        if (!this.fileExists())
+            await this.vaultStore.adoptLegacySecret();
+    }
+    async withRefreshLock(action) {
+        return this.fileExists() ? this.fileStore.withRefreshLock(action) : this.vaultStore.withRefreshLock(action);
     }
 }
 export const FILE_CREDENTIALS_ACK_FILENAME = 'allow-file-credentials';
@@ -375,7 +725,11 @@ export async function createDefaultCredentialStore(options = {}) {
     if (existingFile)
         return { store: fileStore, backend: 'file' };
     if (await vault.isAvailable()) {
-        return { store: new VaultCredentialStore(vault, fileStore, options.baseDir), backend: 'os_vault' };
+        const vaultStore = new VaultCredentialStore(vault, fileStore, options.baseDir);
+        if (options.fileFallbackOnVaultFailure) {
+            return { store: new VaultWithFileFallbackStore(vaultStore, fileStore, options.baseDir, warn), backend: 'os_vault' };
+        }
+        return { store: vaultStore, backend: 'os_vault' };
     }
     const allowFile = options.allowFileCredentials === true ||
         existingFile ||

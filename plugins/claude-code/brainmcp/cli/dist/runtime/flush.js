@@ -4,7 +4,7 @@ import { listQueueItems, updateQueueItem, getQueueDir } from './queue.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { readPreferences, readSafeJson, resolveStateDir, writeAtomic0600 } from './storage.js';
 import { SessionLockTimeoutError, withSessionLock } from './lock.js';
-import { queuedItemProjectAllowsCapture } from './capture.js';
+import { captureConsentActive, queuedItemProjectAllowsCapture } from './capture.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,6 +22,29 @@ export const DIGEST_CAP_ERROR_CODE = 'pending_digest_cap_reached';
  * spends no attempt; local retention still drops an item after 7 days.
  */
 export const DIGEST_CAP_RETRY_MS = 30 * 60 * 1000;
+/**
+ * After the fast schedule above, an automatic item that keeps meeting
+ * transport errors, 429, or 5xx keeps retrying on this slower schedule instead
+ * of ending `failed`: through 0.1.38 a two-minute outage spent all 8 attempts
+ * and the session slice was lost. Local retention still drops an item 7 days
+ * after it was queued (`AUTOMATIC_RETRY_WINDOW_MS`).
+ */
+const OUTAGE_BACKOFF_MS = [5 * 60 * 1000, 15 * 60 * 1000, 30 * 60 * 1000];
+/** The local queue retention (retention.ts): an automatic item retries no longer than this after it was queued. */
+export const AUTOMATIC_RETRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * When an automatic item that has spent `attempts` deliveries retries next, or
+ * null once that would fall outside the retention window.
+ */
+export function automaticOutageRetryAt(attempts, createdAt, now = Date.now()) {
+    const step = Math.max(0, attempts - MAX_CAPTURE_ATTEMPTS);
+    const delay = OUTAGE_BACKOFF_MS[Math.min(step, OUTAGE_BACKOFF_MS.length - 1)];
+    const created = Date.parse(createdAt);
+    const retryAt = now + delay;
+    if (Number.isFinite(created) && retryAt > created + AUTOMATIC_RETRY_WINDOW_MS)
+        return null;
+    return new Date(retryAt).toISOString();
+}
 export function isDigestCapRefusal(status, code) {
     return status === 409 && code === DIGEST_CAP_ERROR_CODE;
 }
@@ -197,6 +220,21 @@ export async function flushCaptureQueue(options) {
         : options.credentials;
     /** Workspace id → when its digests may be sent again, after a pending-cap refusal in this run. */
     const cappedWorkspaces = new Map();
+    // No usable sign-in to compare against: nothing is sent and nothing is
+    // cancelled. A grant marked for re-login (refresh rejected, or a vault record
+    // read without its other half, which a concurrent save can briefly cause)
+    // and a read that found no record (the vault can return none when its
+    // command fails or times out) must not count as "another authorization":
+    // that would cancel every due item for good. Logout clears the queue itself,
+    // and a new login under another grant still cancels the old items below.
+    if (!credentials || (credentials.authType === 'oauth' && credentials.reauthRequired)) {
+        result.skipped = items.length;
+        logRuntimeEvent('info', 'capture_flush_no_usable_credentials', {
+            reason: credentials ? credentials.reauthRequired?.reason ?? 'reauth_required' : 'no_credentials',
+            items: items.length,
+        }, options.baseDir);
+        return result;
+    }
     for (const item of items) {
         if (options.signal?.aborted)
             break;
@@ -221,7 +259,7 @@ export async function flushCaptureQueue(options) {
         // own projects, not the starting hook's, decide whether it may leave.
         const consentStillMatches = () => {
             const prefs = readPreferences(options.baseDir);
-            return prefs?.consent?.captureEnabled === true &&
+            return prefs !== null && captureConsentActive(prefs) &&
                 (!isAutomatic || options.allowAutomatic === true) &&
                 item.consentRevision !== undefined && item.consentRevision === (prefs.consent.revision ?? 0) &&
                 (!isAutomatic || item.workspaceId === prefs.enabledWorkspaceId) &&
@@ -371,7 +409,13 @@ export async function flushCaptureQueue(options) {
             continue;
         }
         const attempts = claimed.attempts + 1;
-        if (attempts >= MAX_CAPTURE_ATTEMPTS) {
+        const endedAt = options.now ?? Date.now();
+        // Automatic items outlast an outage on the slow schedule; a manual one is
+        // the user's to resend with `capture now`.
+        const outageRetryAt = attempts >= MAX_CAPTURE_ATTEMPTS && isAutomatic
+            ? automaticOutageRetryAt(attempts, claimed.createdAt, endedAt)
+            : undefined;
+        if (attempts >= MAX_CAPTURE_ATTEMPTS && !outageRetryAt) {
             await finish({ status: 'failed', failureClass: 'retry_exhausted', attempts, lastError: response.message ?? 'retry limit reached',
                 lastErrorCode: response.code });
             result.failed += 1;
@@ -383,7 +427,7 @@ export async function flushCaptureQueue(options) {
             status: unknown ? 'delivery_unknown' : 'pending',
             attempts,
             // Back off from when this attempt ended: a slow request must not leave the retry already due.
-            nextRetryAt: nextRetryAt(attempts, options.now ?? Date.now()),
+            nextRetryAt: outageRetryAt ?? nextRetryAt(attempts, endedAt),
             lastError: response.message,
             lastErrorCode: response.code,
         });

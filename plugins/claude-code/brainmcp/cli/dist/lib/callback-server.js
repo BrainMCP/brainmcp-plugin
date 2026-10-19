@@ -96,6 +96,20 @@ export async function startCallbackServer(options) {
         // Mark as consumed
         isConsumed = true;
         hasFinished = true;
+        // RFC 9207: an `iss` that names another server means this response came
+        // from (or was mixed up with) a different authorization server. Its code
+        // must never reach our token endpoint, so the login fails here.
+        const iss = parsedUrl.searchParams.get('iss');
+        if (iss !== null && options.expectedIssuer !== undefined && iss !== options.expectedIssuer) {
+            res.writeHead(400, { 'Content-Type': 'text/html' });
+            res.end(ERROR_HTML('The authorization response came from an unexpected issuer.'));
+            resolveResult({
+                error: 'invalid_issuer',
+                errorDescription: 'The authorization response named an unexpected issuer (iss); the login was stopped.',
+            });
+            setTimeout(() => void closeServer(), 500);
+            return;
+        }
         const error = parsedUrl.searchParams.get('error');
         const errorDescription = parsedUrl.searchParams.get('error_description') ?? undefined;
         const code = parsedUrl.searchParams.get('code') ?? undefined;

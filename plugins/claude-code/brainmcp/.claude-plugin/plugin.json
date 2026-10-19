@@ -1,7 +1,7 @@
 {
   "name": "brainmcp",
   "displayName": "brainMCP",
-  "version": "0.1.38",
+  "version": "0.1.40",
   "description": "Shared, reviewable project memory for Claude Code: the brain MCP server, its usage and setup skills, and orientation plus opt-in session-capture hooks.",
   "author": {
     "name": "BrainMCP",

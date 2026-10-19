@@ -1,10 +1,10 @@
 # brainMCP for Cursor
 
-Version 0.1.38 (guidance 2026.10.15). Shared, reviewable project memory for coding agents: Cursor agents orient from your Brain workspace before work and propose durable learnings back as reviewable changes.
+Version 0.1.40 (guidance 2026.10.15). Shared, reviewable project memory for coding agents: Cursor agents orient from your Brain workspace before work and propose durable learnings back as reviewable changes.
 
 ## Install
 
-Add `BrainMCP/brainmcp-plugin` as a plugin marketplace in Cursor (or install brainMCP from the Cursor Marketplace once listed), then open **Settings → Tools & MCP**, select **brain**, and connect it. Choose the workspaces this connection may reach in the browser.
+For most Cursor users the recommended setup is still `npx --yes @brainmcp/brainmcp@latest init --client cursor --scope user` ([guide](https://www.brainmcp.ai/docs/connect-cursor)), which also adds session-start hooks. This plugin is for Cursor Teams and Enterprise admins: import `BrainMCP/brainmcp-plugin` as a team marketplace (Cursor offers team marketplaces only on those plans), then open **Settings → Tools & MCP**, select **brain**, and connect it. Choose the workspaces this connection may reach in the browser. A Cursor Marketplace listing will follow.
 
 ## What is inside
 

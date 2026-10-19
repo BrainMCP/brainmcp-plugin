@@ -64,6 +64,9 @@ export function validatePreferencesRecord(data) {
             revision: typeof consent.revision === 'number' && Number.isSafeInteger(consent.revision)
                 ? Math.max(0, consent.revision)
                 : 0,
+            ...(typeof consent.lastDisabledRevision === 'number' && Number.isSafeInteger(consent.lastDisabledRevision)
+                ? { lastDisabledRevision: Math.max(0, consent.lastDisabledRevision) }
+                : {}),
         },
         enabledWorkspaceId: typeof obj.enabledWorkspaceId === 'string' ? obj.enabledWorkspaceId : undefined,
         nudgeEnabled: typeof obj.nudgeEnabled === 'boolean' ? obj.nudgeEnabled : false,
@@ -122,7 +125,7 @@ export function validateSessionLedgerRecord(data) {
 }
 /** Bounds for `projectRoots`: hosts report a handful of workspace folders. */
 export const MAX_QUEUE_PROJECT_ROOTS = 32;
-const MAX_QUEUE_PROJECT_ROOT_CHARS = 4096;
+export const MAX_QUEUE_PROJECT_ROOT_CHARS = 4096;
 const QUEUE_ERROR_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
 // `satisfies` makes typecheck fail when a contract value is added or removed.
 const CAPTURE_TRIGGERS = { manual: true, pre_compact: true, session_end: true };

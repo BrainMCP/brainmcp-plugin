@@ -18,6 +18,24 @@ export function assertVaultKey(key) {
     if (!VAULT_KEY_PATTERN.test(key))
         throw new Error('Invalid credential vault key.');
 }
+/**
+ * `security -i` reads its commands with a fixed-size line buffer: a line over
+ * about 4096 bytes is split, so `add-generic-password -U` overwrites the good
+ * item with a truncated value and the remainder runs as an unknown command.
+ * Lines above this limit are never written.
+ */
+export const MACOS_SECURITY_MAX_LINE_BYTES = 4000;
+/** A secret too large for the vault's input channel. Nothing was written. */
+export class VaultValueTooLargeError extends Error {
+    constructor(message = 'The credentials are too large for the OS credential vault; nothing was written.') {
+        super(message);
+        this.name = 'VaultValueTooLargeError';
+    }
+}
+export function macosSecurityAddLine(value, key) {
+    const hex = Buffer.from(value, 'utf8').toString('hex');
+    return `add-generic-password -U -s ${VAULT_SERVICE} -a ${key} -w ${hex}\n`;
+}
 export class MemorySecretVault {
     name = 'memory';
     secrets = new Map();
@@ -84,7 +102,11 @@ export class MacosSecurityVault {
     }
     async setSecret(value, key = VAULT_ACCOUNT) {
         assertVaultKey(key);
-        const hex = Buffer.from(value, 'utf8').toString('hex');
+        const line = macosSecurityAddLine(value, key);
+        // Checked before spawning: an over-long line would replace the stored item
+        // with a truncated (unusable) value.
+        if (Buffer.byteLength(line, 'utf8') > MACOS_SECURITY_MAX_LINE_BYTES)
+            throw new VaultValueTooLargeError();
         await new Promise((resolve, reject) => {
             const child = this.spawnProcess('security', ['-i'], { stdio: ['pipe', 'ignore', 'ignore'] });
             const timer = setTimeout(() => {
@@ -103,7 +125,7 @@ export class MacosSecurityVault {
                 else
                     done(() => reject(new Error('macOS keychain store failed')));
             });
-            child.stdin.write(`add-generic-password -U -s ${VAULT_SERVICE} -a ${key} -w ${hex}\n`);
+            child.stdin.write(line);
             child.stdin.end();
         });
     }

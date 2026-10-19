@@ -39,8 +39,10 @@ Clients: ${CLIENT_IDS.join(', ')}
 Project scope is the default. User scope writes to each host's supported per-user locations.
 When the brainmcp plugin is enabled in Claude Code or Codex, init leaves the MCP entry and hooks to the
 plugin (removing any it wrote earlier) and writes only guidance; --ignore-plugin keeps the old behavior.
-bind writes the project's .brainmcp.json workspace binding (the nearest one, else one at the Git root), so
-agents there orient to that workspace and capture never lands in another; bind alone shows the binding.
+bind writes the project's .brainmcp.json workspace binding (the nearest one inside the Git repository, else one
+at the Git root; outside a Git repository or in your home directory only with an explicit --root, which binds
+exactly <dir>/.brainmcp.json), so agents there orient to that workspace and capture never lands in another;
+bind alone shows the binding.
 Every mutation previews a diff and needs confirmation unless a trailing CLI --yes is supplied.
 The leading npx --yes above accepts npm's package download; it does not skip the file preview.`;
 /** Positional actions; only `capture` takes them. */
@@ -373,6 +375,7 @@ export async function dispatch(rawArgs, context = {}) {
                 }
                 return await bindProject({
                     startDir: parsed.root ?? currentRoot,
+                    explicitRoot: parsed.root !== undefined,
                     workspace: parsed.workspace,
                     unbind: parsed.command === 'unbind',
                     yes: parsed.yes,

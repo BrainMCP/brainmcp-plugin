@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CAPTURE_POLICY_VERSION, scrubDigestSecrets } from '../agent-config.js';
-import { MAX_QUEUE_PROJECT_ROOTS, PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, } from '../lib/cli-contracts.js';
+import { MAX_QUEUE_PROJECT_ROOT_CHARS, MAX_QUEUE_PROJECT_ROOTS, PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, } from '../lib/cli-contracts.js';
 import { readPreferences, writePreferences } from './storage.js';
 import { listQueueItems, updateQueueItem } from './queue.js';
 import { logRuntimeEvent } from './diagnostics.js';
@@ -188,7 +188,11 @@ export function collectGitMetadata(cwd, options) {
         return undefined;
     const budget = GIT_METADATA_BUDGETS[options.trigger];
     const stopAt = Math.min(Date.now() + budget.totalMs, options.deadlineAt ?? Number.POSITIVE_INFINITY);
-    const run = options.runner ?? ((args, timeoutMs) => execFileSync('git', ['-C', cwd, ...args], {
+    // A hook must not take `index.lock`: a git command the user runs at the same
+    // moment would fail. `status` refreshes the index under it unless
+    // `--no-optional-locks` is given; `git diff` does even then, so the diff
+    // counts come from the plumbing `diff-index`, which never writes the index.
+    const run = options.runner ?? ((args, timeoutMs) => execFileSync('git', ['--no-optional-locks', '-C', cwd, ...args], {
         encoding: 'utf8',
         timeout: timeoutMs,
         maxBuffer: 64 * 1024,
@@ -228,7 +232,7 @@ export function collectGitMetadata(cwd, options) {
     }
     const branch = outputOf('branch', read(['branch', '--show-current'], budget.labelTimeoutMs));
     const commit = outputOf('commit', read(['rev-parse', '--short=12', 'HEAD'], budget.labelTimeoutMs));
-    const numstat = outputOf('diff', read(['diff', '--numstat', 'HEAD'], budget.statsTimeoutMs));
+    const numstat = outputOf('diff', read(['diff-index', '--numstat', 'HEAD'], budget.statsTimeoutMs));
     const changedFiles = outputOf('status', read(['status', '--porcelain=v1', '--untracked-files=no'], budget.statsTimeoutMs));
     reportFailures();
     const metadata = {
@@ -387,6 +391,41 @@ export function serializeDigestPayload(payload) {
     return json;
 }
 /**
+ * What digest capture uploads, shown before consent (`login --capture-digests`,
+ * `capture enable`). Change it together with CAPTURE_POLICY_VERSION: consent
+ * recorded under another version pauses capture until the user accepts again.
+ * Through 0.1.37 it said assistant text was a "stable summary"; since 0.1.38
+ * Claude Code and Codex capture reads the closing replies from the host
+ * transcript (TRANSCRIPT_SUMMARY_MAX_TURNS × TRANSCRIPT_SUMMARY_TURN_MAX_CHARS).
+ */
+export const CAPTURE_DISCLOSURE = 'Digest capture uploads to Brain: host and model labels; Git metadata (branch, commit, repository, diff counts); relative edited paths; ' +
+    "and the assistant's own replies: for Claude Code and Codex, the closing assistant message of each of the latest 3 turns " +
+    '(up to 1,500 characters each, at most 4,000 characters per digest), which can repeat code, file contents, or tool output the assistant quoted. ' +
+    'Secret-like strings are scrubbed first. Your prompts are excluded unless you opt in with --include-prompts; raw transcripts, files read from disk, ' +
+    'tool payloads, and environment variables are not uploaded. Disable with `brainmcp capture disable`.';
+/** How to accept the current capture policy after it changed. */
+export const CAPTURE_RECONSENT_COMMAND = 'brainmcp capture enable';
+/**
+ * The re-consent command for these preferences. `capture enable` records a new
+ * consent with prompts off unless `--include-prompts` is passed, so a user who
+ * had opted in to prompts is told to pass it again.
+ */
+export function captureReconsentCommand(prefs) {
+    return prefs?.consent?.includePrompts ? `${CAPTURE_RECONSENT_COMMAND} --include-prompts` : CAPTURE_RECONSENT_COMMAND;
+}
+/** Capture is on and its consent was given to the current policy version. */
+export function captureConsentActive(prefs) {
+    return prefs?.consent?.captureEnabled === true && prefs.consent.policyVersion === CAPTURE_POLICY_VERSION;
+}
+/**
+ * Capture is on, but its consent was given to an earlier policy version: it
+ * is paused (nothing is recorded, queued, or sent) until the user accepts the
+ * current policy with `brainmcp capture enable`.
+ */
+export function captureConsentOutdated(prefs) {
+    return prefs?.consent?.captureEnabled === true && prefs.consent.policyVersion !== CAPTURE_POLICY_VERSION;
+}
+/**
  * Enables capture for the user (AHI-071, AHI-072).
  */
 export function enableCapture(options) {
@@ -400,10 +439,18 @@ export function enableCapture(options) {
         },
     };
     const workspaceId = options?.workspaceId?.trim();
+    const previousRevision = current.consent.revision ?? 0;
+    // A disabled consent at a revision above 0 was written by a disable. One an
+    // older CLI (0.1.38 and earlier) wrote carries no lastDisabledRevision, so it
+    // is recorded here, before the revision moves past it.
+    const lastDisabledRevision = !current.consent.captureEnabled && previousRevision > 0
+        ? Math.max(current.consent.lastDisabledRevision ?? 0, previousRevision)
+        : current.consent.lastDisabledRevision;
     const updated = {
         ...current,
         consent: {
             ...current.consent,
+            ...(lastDisabledRevision !== undefined ? { lastDisabledRevision } : {}),
             captureEnabled: true,
             includePrompts: Boolean(options?.includePrompts),
             // Consent given now is to the current policy, even when an older one is on file.
@@ -430,21 +477,28 @@ export function disableCapture(options) {
             revision: 0,
         },
     };
+    const revision = (current.consent.revision ?? 0) + 1;
     const updated = {
         ...current,
         consent: {
             ...current.consent,
             captureEnabled: false,
             includePrompts: false,
-            revision: (current.consent.revision ?? 0) + 1,
+            revision,
+            // `capture now` never requeues an item queued at or before this revision.
+            lastDisabledRevision: revision,
         },
     };
     writePreferences(updated, options?.baseDir);
-    // Cancel only unsent automatic items. Manual items remain explicit user
-    // actions, and ambiguous in-flight deliveries retain their honest status.
+    // Cancel only unsent automatic items, including ones that ran out of
+    // retries: `capture now` requeues those across a later re-consent, which must
+    // not resurrect what a disable withdrew (lastDisabledRevision also keeps it
+    // from requeueing a failed item an older CLI's disable left behind). Manual
+    // items remain explicit user actions, and ambiguous in-flight deliveries
+    // retain their honest status.
     const items = listQueueItems(options?.baseDir);
     for (const item of items) {
-        if (item.captureTrigger !== 'manual' && item.status === 'pending') {
+        if (item.captureTrigger !== 'manual' && (item.status === 'pending' || item.status === 'failed')) {
             updateQueueItem(item.digestId, {
                 status: 'cancelled',
                 lastError: 'Capture disabled by user',
@@ -452,6 +506,32 @@ export function disableCapture(options) {
         }
     }
     return updated;
+}
+/**
+ * Whether an automatic item queued under consent revision `itemRevision` may
+ * be requeued (and re-stamped) under the current consent: never when a
+ * disable may lie between the two, since that disable withdrew it.
+ *
+ * - Same revision: yes.
+ * - With `lastDisabledRevision` on file (0.1.40+ disable, or recorded by the
+ *   next enable after an older CLI's disable): only items queued after it. An
+ *   older CLI's later write drops the field, so its presence means every
+ *   disable since was recorded.
+ * - Without it, a 0.1.38 or older CLI may have disabled and re-enabled with
+ *   no record. Items are queued only while capture is enabled, and capture is
+ *   enabled now, so exactly one revision between them is an enable (a
+ *   re-consent); a larger gap may include a disable, so the item is skipped.
+ */
+export function consentRevisionAllowsRequeue(itemRevision, prefs) {
+    const current = prefs.consent.revision ?? 0;
+    if (itemRevision === undefined || !Number.isSafeInteger(itemRevision) || itemRevision > current)
+        return false;
+    if (itemRevision === current)
+        return true;
+    const lastDisabled = prefs.consent.lastDisabledRevision;
+    if (lastDisabled !== undefined)
+        return itemRevision > lastDisabled;
+    return current - itemRevision === 1;
 }
 /**
  * Checks whether an event may be queued or sent (AHI-076).
@@ -464,30 +544,62 @@ export function isCaptureEligible(event, prefs, projectPolicy) {
     if (projectPolicy?.captureDisabled) {
         return false;
     }
-    if (!prefs?.consent?.captureEnabled) {
+    // Consent to an earlier capture policy does not cover the current one.
+    if (!captureConsentActive(prefs)) {
         return false;
     }
     return CAPTURE_EVENTS.has(event);
 }
 /**
  * The project roots a hook or `capture now` records on its queue item, so each
- * send can re-read their policy. Resolved, deduplicated and bounded; never sent.
+ * send can re-read their policy. Resolved and deduplicated; never sent.
+ * Undefined when they do not all fit the queue item's bounds: a root left out
+ * could not stop the digest later (an opt-out or a new binding there would go
+ * unseen at send time), so the caller does not capture.
  */
 export function queueProjectRoots(roots) {
-    return [...new Set(roots.map((root) => path.resolve(root)))].slice(0, MAX_QUEUE_PROJECT_ROOTS);
+    const resolved = [...new Set(roots.map((root) => path.resolve(root)))];
+    return resolved.length <= MAX_QUEUE_PROJECT_ROOTS && resolved.every((root) => root.length <= MAX_QUEUE_PROJECT_ROOT_CHARS)
+        ? resolved
+        : undefined;
+}
+/**
+ * Whether a queued digest carries prompt text. Every producer stores a
+ * serialized `DigestPayload`; text that does not parse as one cannot be shown
+ * to be prompt-free, so it counts as carrying prompts.
+ */
+export function queuedDigestCarriesPrompts(digestText) {
+    if (!digestText.trim())
+        return false;
+    try {
+        const parsed = JSON.parse(digestText);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+            return true;
+        const prompts = parsed.prompts;
+        return prompts !== undefined && prompts !== null && !(Array.isArray(prompts) && prompts.length === 0);
+    }
+    catch {
+        return true;
+    }
 }
 /**
  * Whether the projects a queued item was captured in still allow sending it
  * to `workspaceId`: each root's nearest `.brainmcp.json` is re-read for an
- * opt-out and for a binding to another (or no valid) workspace. An automatic
- * item queued before 0.1.38 records no roots and fails closed; such a manual
- * item was an explicit `capture now` and keeps its earlier behavior.
+ * opt-out, for a prompt opt-out when the digest carries prompts, and for a
+ * binding to another (or no valid) workspace. An automatic item queued before
+ * 0.1.38 records no roots and fails closed; such a manual item was an explicit
+ * `capture now` and keeps its earlier behavior.
  */
 export function queuedItemProjectAllowsCapture(item, workspaceId) {
     const roots = item.projectRoots;
     if (!roots)
         return item.captureTrigger === 'manual';
-    if (roots.some((root) => readProjectCaptureRestrictions(root).captureDisabled))
+    const restrictions = roots.map((root) => readProjectCaptureRestrictions(root));
+    if (restrictions.some((policy) => policy.captureDisabled))
+        return false;
+    // The prompts were allowed when the slice was queued; a project that has
+    // since set `includePrompts: false` stops them on every send and retry.
+    if (restrictions.some((policy) => policy.promptsDisabled) && queuedDigestCarriesPrompts(item.digestText))
         return false;
     return !projectBindingBlocksCapture(roots, workspaceId);
 }

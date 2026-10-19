@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import { CAPTURE_POLICY_VERSION } from '../agent-config.js';
-import { enableCapture, disableCapture, buildDigestPayload, collectGitMetadata, serializeDigestPayload, MAX_DIGEST_BYTES, MAX_DIGEST_CHARS, readProjectCaptureRestrictions, captureProjectKey, captureProjectBindingConflict, queueProjectRoots, } from '../runtime/capture.js';
+import { enableCapture, disableCapture, buildDigestPayload, collectGitMetadata, serializeDigestPayload, MAX_DIGEST_BYTES, MAX_DIGEST_CHARS, readProjectCaptureRestrictions, captureProjectKey, captureProjectBindingConflict, queueProjectRoots, CAPTURE_DISCLOSURE, captureReconsentCommand, captureConsentActive, captureConsentOutdated, consentRevisionAllowsRequeue, queuedDigestCarriesPrompts, resolveCaptureWorkspaceId, } from '../runtime/capture.js';
 import { readPreferences, resolveStateDir } from '../runtime/storage.js';
 import { listQueueItems, updateQueueItem } from '../runtime/queue.js';
 import { flushCaptureQueue, queueItemFailureClass, readCaptureStatus, MAX_CAPTURE_ATTEMPTS, } from '../runtime/flush.js';
-import { withSessionLock } from '../runtime/lock.js';
+import { SessionLockTimeoutError, withSessionLock } from '../runtime/lock.js';
 import { previewCapturePurge, purgeCaptureLocalState } from '../runtime/retention.js';
 import { loadMostRecentSessionLedger, queueSessionCapture, sessionSliceDigestId } from '../runtime/session.js';
 import { CLI_EXIT_CODES, isWorkspaceUuid, } from '../lib/cli-contracts.js';
@@ -27,6 +27,10 @@ export function captureStatus(options) {
         .at(-1) ?? null;
     const data = {
         enabled: Boolean(prefs?.consent?.captureEnabled),
+        // Consent to an earlier policy version: capture is paused until `capture enable` accepts the current one.
+        reconsentRequired: captureConsentOutdated(prefs),
+        ...(captureConsentOutdated(prefs) ? { reconsentCommand: captureReconsentCommand(prefs) } : {}),
+        currentPolicyVersion: CAPTURE_POLICY_VERSION,
         includePrompts: Boolean(prefs?.consent?.includePrompts),
         policyVersion: prefs?.consent?.policyVersion ?? CAPTURE_POLICY_VERSION,
         consentedAt: prefs?.consent?.consentedAt ?? null,
@@ -158,7 +162,8 @@ export async function captureEnable(options) {
             includePrompts: Boolean(updated.consent.includePrompts),
             policyVersion: updated.consent.policyVersion,
             workspaceId: updated.enabledWorkspaceId ?? null,
-            message: 'Digest capture enabled successfully.',
+            disclosure: CAPTURE_DISCLOSURE,
+            message: `Digest capture enabled under capture policy ${updated.consent.policyVersion}. ${CAPTURE_DISCLOSURE}`,
         },
     };
 }
@@ -223,10 +228,12 @@ function refusedEarlier(failure) {
                 message: `This session slice was refused earlier: the grant lacks digest access to this workspace, or server policy disables capture. ${RECORD_NEW_ACTIVITY}`,
             };
         case 'retry_exhausted':
-            // Only an automatic item reaches this; `capture now` resets a manual one instead.
+            // Only an automatic item `capture now` could not requeue reaches this (another
+            // sign-in or workspace, a consent a disable withdrew, prompts the current
+            // consent excludes, or a busy queue); a manual one is reset instead.
             return {
                 exitCode: CLI_EXIT_CODES.GENERAL_ERROR,
-                message: `The automatic capture of this session slice failed after repeated delivery attempts and will not be resent. ${RECORD_NEW_ACTIVITY}`,
+                message: `The automatic capture of this session slice failed after repeated delivery attempts and could not be requeued: it belongs to another sign-in or to a workspace other than the capture workspace, it was queued before a capture disable (which withdrew it) or carries prompts the current consent excludes, or another BrainMCP process held the queue (retry \`brainmcp capture now\` in a moment). ${RECORD_NEW_ACTIVITY}`,
             };
         default:
             return {
@@ -291,6 +298,67 @@ async function retryEarlierManualItems(run, excludeDigestId) {
         requests: flushed.requests,
         queueBusy: Boolean(flushed.queueBusy),
     };
+}
+/**
+ * Automatic items of the current sign-in and capture workspace that ran out of
+ * retries (items failed by 0.1.38 and earlier runtimes after a short outage,
+ * or past the retention window's last retry) go back to `pending`. The
+ * exhausted items belong to the sign-in, not to a project, so `capture now`
+ * runs this from any project, whatever its ledger or binding says. Only the
+ * capture workspace (`enabledWorkspaceId`): the flush cancels an automatic
+ * item for any other workspace, so `--workspace` never widens this.
+ *
+ * An item queued under an earlier consent revision (re-consent to a new
+ * capture policy bumps it) is re-stamped to the current one, which the send
+ * requires, unless a capture disable may lie between the two
+ * (consentRevisionAllowsRequeue): a disable withdrew it, including a failed
+ * item an older CLI's disable did not cancel. One that carries prompts the
+ * current consent no longer includes stays failed. Only the lifecycle hooks
+ * send them, with their project policy; the server deduplicates on
+ * clientDigestId if an earlier attempt landed. Preferences are re-read under
+ * the queue lock. Returns how many were requeued.
+ */
+async function requeueExhaustedAutomaticItems(baseDir, credentials) {
+    if (credentials?.authType !== 'oauth' || !credentials.authorizationId || credentials.reauthRequired ||
+        !credentials.scopes?.includes('digests:write'))
+        return 0;
+    const authorizationId = credentials.authorizationId;
+    try {
+        return await withSessionLock('capture-queue', () => {
+            const prefs = readPreferences(baseDir);
+            const captureWorkspaceId = resolveCaptureWorkspaceId(prefs);
+            if (!prefs || !captureConsentActive(prefs) || !captureWorkspaceId || !credentials.workspaces?.includes(captureWorkspaceId))
+                return 0;
+            const consentRevision = prefs.consent.revision ?? 0;
+            let requeued = 0;
+            for (const item of listQueueItems(baseDir)) {
+                if (item.captureTrigger === 'manual' || item.status !== 'failed' || queueItemFailureClass(item) !== 'retry_exhausted')
+                    continue;
+                if (item.authorizationId !== authorizationId || item.workspaceId !== captureWorkspaceId)
+                    continue;
+                if (!consentRevisionAllowsRequeue(item.consentRevision, prefs))
+                    continue;
+                if (item.consentRevision !== consentRevision && !prefs.consent.includePrompts && queuedDigestCarriesPrompts(item.digestText))
+                    continue;
+                if (updateQueueItem(item.digestId, {
+                    status: 'pending', attempts: 0, nextRetryAt: undefined, failureClass: undefined, lastError: undefined, lastErrorCode: undefined,
+                    consentRevision,
+                }, baseDir))
+                    requeued += 1;
+            }
+            return requeued;
+        }, { baseDir, timeoutMs: 250 });
+    }
+    catch (error) {
+        if (error instanceof SessionLockTimeoutError)
+            return 0;
+        throw error;
+    }
+}
+function requeuedMessage(requeued) {
+    return requeued > 0
+        ? ` Requeued ${requeued} automatic capture(s) that had run out of retries; the next lifecycle hook delivers them.`
+        : '';
 }
 /** Deliver or report the slice's queue item according to its current state. */
 async function settleSlice(run, item) {
@@ -423,10 +491,44 @@ function queueFullMessage(run, earlier) {
             : '') +
         earlierSummary(earlier);
 }
+/** One `capture now` run's API client, created on first use and shared by the slice and the requeue. */
+function lazyApiClient(options, credentialHome) {
+    let client;
+    return () => client ??= (async () => options.apiClient ?? new ApiClient({
+        store: options.store ?? (await createDefaultCredentialStore({ baseDir: credentialHome, allowFileCredentials: true, warn: () => undefined })).store,
+    }))();
+}
 export async function captureNow(options) {
     const credentialHome = options?.baseDir;
     const stateDir = resolveStateDir(options?.baseDir);
-    options = { ...options, baseDir: stateDir };
+    const resolved = { ...options, baseDir: stateDir };
+    const apiClient = lazyApiClient(resolved, credentialHome);
+    // The exhausted-item requeue is account-level: it runs once per run, from
+    // any project, whatever this project's ledger or binding says (never on a
+    // dry run). The slice path runs it after reserving its slice, so a requeue
+    // cannot fill the queue cap ahead of it.
+    let requeue;
+    const requeueOnce = () => requeue ??= resolved.dryRun
+        ? Promise.resolve(0)
+        : (async () => {
+            try {
+                return await requeueExhaustedAutomaticItems(stateDir, await (await apiClient()).getEffectiveCredentials());
+            }
+            catch {
+                return 0;
+            }
+        })();
+    const result = await captureSessionSlice(resolved, apiClient, requeueOnce);
+    const requeuedAutomatic = await requeueOnce();
+    const data = result.data;
+    if (requeuedAutomatic > 0 && data.requeuedAutomatic === undefined) {
+        data.requeuedAutomatic = requeuedAutomatic;
+        data.message = `${String(data.message ?? '')}${requeuedMessage(requeuedAutomatic)}`;
+    }
+    return result;
+}
+async function captureSessionSlice(options, getApiClient, requeueOnce) {
+    const stateDir = options.baseDir;
     const prefs = readPreferences(options?.baseDir);
     const workspaceId = (options?.workspace || prefs?.enabledWorkspaceId)?.trim();
     const projectKey = captureProjectKey(options.cwd ?? process.cwd());
@@ -439,7 +541,7 @@ export async function captureNow(options) {
                 captured: false,
                 dryRun: Boolean(options?.dryRun),
                 requestsSent: 0,
-                message: 'No local session ledger is available to capture. Run this command after a managed lifecycle hook has recorded session activity.',
+                message: 'No local session ledger is available to capture in this project. Run this command after a managed lifecycle hook has recorded session activity.',
             },
         };
     }
@@ -473,28 +575,38 @@ export async function captureNow(options) {
             },
         };
     }
+    if (captureConsentOutdated(prefs)) {
+        return {
+            exitCode: CLI_EXIT_CODES.PERMISSION_DENIED,
+            data: {
+                captured: false,
+                requestsSent: 0,
+                reconsentRequired: true,
+                reconsentCommand: captureReconsentCommand(prefs),
+                message: `Capture is paused: you consented to capture policy ${prefs.consent.policyVersion}, and what capture uploads has changed (policy ${CAPTURE_POLICY_VERSION}). Review it and run \`${captureReconsentCommand(prefs)}\` to accept the current policy${prefs.consent.includePrompts ? ' (--include-prompts keeps your prompt opt-in; without it prompts are no longer captured)' : ''}.`,
+            },
+        };
+    }
     const bindingConflict = captureProjectBindingConflict([options.cwd ?? process.cwd()], workspaceId);
     if (bindingConflict) {
         // Fails closed like the lifecycle hooks: a binding that names no valid
         // workspace never falls back to the capture workspace.
         const message = bindingConflict.kind === 'workspace'
             ? `Manual capture was not queued: ${bindingConflict.configPath} binds this project to workspace ${bindingConflict.workspaceId}, but capture targets workspace ${workspaceId} (ledger workspace: ${ledger.workspaceId ?? 'unbound'}). Record new activity under the intended binding.`
-            : `Manual capture was not queued: ${bindingConflict.configPath} has no valid workspaceId (it is missing or not a workspace UUID, or the file is not readable JSON). Set workspaceId to the project's workspace UUID, or remove the file, before capturing.`;
+            : `Manual capture was not queued: ${bindingConflict.configPath} has no valid workspaceId (it is not a workspace UUID, or the file is not readable JSON). Set workspaceId to the project's workspace UUID, or remove the file, before capturing.`;
         return { exitCode: CLI_EXIT_CODES.PERMISSION_DENIED, data: { captured: false, requestsSent: 0, message } };
+    }
+    // Each send rechecks this root's policy, so a root the queue item cannot record is not captured.
+    const projectRoots = queueProjectRoots([options.cwd ?? process.cwd()]);
+    if (!projectRoots) {
+        return { exitCode: CLI_EXIT_CODES.PERMISSION_DENIED, data: { captured: false, requestsSent: 0,
+                message: 'Manual capture was not queued: the project path is too long to record for the policy check each send makes.' } };
     }
     if (projectPolicy.captureDisabled || ledger.captureRevision !== (prefs.consent.revision ?? 0) || ledger.workspaceId !== workspaceId) {
         return { exitCode: CLI_EXIT_CODES.PERMISSION_DENIED, data: { captured: false, requestsSent: 0,
                 message: 'This ledger is restricted by project policy or belongs to a different capture consent/workspace. Record new activity under the current capture settings.' } };
     }
-    let apiClient = options?.apiClient;
-    if (!apiClient) {
-        const store = options?.store ?? (await createDefaultCredentialStore({
-            baseDir: credentialHome,
-            allowFileCredentials: true,
-            warn: () => undefined,
-        })).store;
-        apiClient = new ApiClient({ store });
-    }
+    const apiClient = await getApiClient();
     const creds = await apiClient.getEffectiveCredentials();
     if (creds?.authType !== 'oauth' ||
         !creds.accessToken ||
@@ -575,7 +687,7 @@ export async function captureNow(options) {
             digestText: serializeDigestPayload(payload),
             authorizationId: run.authorizationId,
             consentRevision: run.consentRevision,
-            projectRoots: queueProjectRoots([options.cwd ?? process.cwd()]),
+            projectRoots,
         },
     });
     // Advancing lastCapturedSequence at enqueue is deliberate (concurrent hooks
@@ -620,6 +732,9 @@ export async function captureNow(options) {
         digestId = sliceDigestId(ledger.lastCapturedSequence ?? 0);
         item = findQueueItem(run.baseDir, digestId);
     }
+    const requeuedAutomatic = await requeueOnce();
+    if (requeuedAutomatic > 0 && item)
+        item = findQueueItem(run.baseDir, digestId);
     const outcome = await settleSlice(run, item);
     earlier ??= outcome.retryEarlier
         ? await retryEarlierManualItems(run, digestId)
@@ -640,11 +755,12 @@ export async function captureNow(options) {
             unknown: outcome.flushed?.unknown ?? 0,
             queueBusy: Boolean(outcome.flushed?.queueBusy || earlier.queueBusy),
             retriedEarlier: earlier.retried,
+            ...(requeuedAutomatic > 0 ? { requeuedAutomatic } : {}),
             ...(earlier.waiting > 0
                 ? { earlierOutcomes: { delivered: earlier.delivered, failed: earlier.failed, stillQueued: earlier.stillQueued } }
                 : {}),
             ...(outcome.payload !== undefined ? { payload: outcome.payload } : {}),
-            message: outcome.message + earlierSummary(earlier),
+            message: outcome.message + earlierSummary(earlier) + requeuedMessage(requeuedAutomatic),
         },
     };
 }

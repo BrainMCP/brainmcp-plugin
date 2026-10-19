@@ -1,8 +1,9 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { CLI_EXIT_CODES, CliConfigurationError, isWorkspaceUuid } from '../lib/cli-contracts.js';
 import { applyChanges, renderDiff } from '../lib/files.js';
-import { readProjectWorkspaceId } from '../runtime/orient.js';
+import { bindingWalkStart, gitEntryEndsBindingWalk, readProjectWorkspaceId } from '../runtime/orient.js';
 import { readPreferences } from '../runtime/storage.js';
 import { WORKSPACE_UUID_REQUIRED } from '../lib/config.js';
 /**
@@ -17,30 +18,58 @@ export const PROJECT_BINDING_FILE = '.brainmcp.json';
 /** The same walk limit and size cap the hooks read the binding with (orient.ts, capture.ts). */
 const MAX_ANCESTOR_DEPTH = 16;
 const MAX_BINDING_BYTES = 64 * 1024;
-function hasGitEntry(dir) {
-    return fs.lstatSync(path.join(dir, '.git'), { throwIfNoEntry: false }) !== undefined;
-}
 /**
- * The file a binding belongs in: the nearest existing `.brainmcp.json` (the
- * one hooks read), else one at the nearest Git root, else in the start
- * directory itself.
+ * The file a binding belongs in. The walk stops at the nearest Git root (for a
+ * linked worktree nested in its main checkout, that checkout's root, the same
+ * rule the hooks apply: gitEntryEndsBindingWalk): the nearest existing
+ * `.brainmcp.json` at or below it (the one hooks read), else a new one at the
+ * Git root. A file above the Git root belongs to some other tree and is never
+ * edited from inside this repository. Outside any Git repository the target is
+ * the start directory itself, which, like the home directory, needs an
+ * explicit `--root`. With `exact` (an explicit `--root`) the target is the
+ * start directory's own file, wherever it is.
  */
-export function resolveBindTarget(startDir) {
-    const start = path.resolve(startDir);
+export function resolveBindTarget(startDir, homeDir = os.homedir(), exact = false) {
+    if (exact) {
+        const filePath = path.join(path.resolve(startDir), PROJECT_BINDING_FILE);
+        return { filePath, exists: fs.lstatSync(filePath, { throwIfNoEntry: false }) !== undefined };
+    }
+    // The real path, as the hooks walk it (bindingWalkStart): a symlinked
+    // directory binds the tree it is really in.
+    const start = bindingWalkStart(startDir);
     let dir = start;
+    let nearestFile;
     let gitRoot;
     for (let depth = 0; depth < MAX_ANCESTOR_DEPTH; depth += 1) {
         const candidate = path.join(dir, PROJECT_BINDING_FILE);
-        if (fs.lstatSync(candidate, { throwIfNoEntry: false }))
-            return { filePath: candidate, exists: true };
-        if (!gitRoot && hasGitEntry(dir))
+        if (!nearestFile && fs.lstatSync(candidate, { throwIfNoEntry: false }))
+            nearestFile = candidate;
+        if (gitEntryEndsBindingWalk(dir)) {
             gitRoot = dir;
+            break;
+        }
         const parent = path.dirname(dir);
         if (parent === dir)
             break;
         dir = parent;
     }
-    return { filePath: path.join(gitRoot ?? start, PROJECT_BINDING_FILE), exists: false };
+    const target = gitRoot
+        ? { filePath: nearestFile ?? path.join(gitRoot, PROJECT_BINDING_FILE), exists: Boolean(nearestFile) }
+        : (() => {
+            const filePath = path.join(start, PROJECT_BINDING_FILE);
+            return { filePath, exists: fs.lstatSync(filePath, { throwIfNoEntry: false }) !== undefined, requiresExplicitRoot: 'no_git_root' };
+        })();
+    const targetDir = path.dirname(target.filePath);
+    if (targetDir === path.resolve(homeDir) || targetDir === bindingWalkStart(homeDir))
+        target.requiresExplicitRoot = 'home_directory';
+    return target;
+}
+function refuseImplicitTarget(target) {
+    const dir = path.dirname(target.filePath);
+    const why = target.requiresExplicitRoot === 'home_directory'
+        ? `${dir} is your home directory`
+        : `${dir} is not inside a Git repository`;
+    throw new CliConfigurationError(`Refusing to write ${target.filePath}: ${why}, so every directory below it that is not inside a Git repository of its own would inherit the binding (a Git repository below it stops at its own root). Run the command inside the repository, or pass \`--root <dir>\` to bind exactly that directory (\`--root ${dir}\` binds this one).`);
 }
 /** The current file as a JSON object; refuses what the hooks would treat as invalid. */
 function readBindingObject(filePath) {
@@ -102,8 +131,8 @@ function render(value) {
     return `${JSON.stringify(value, null, 2)}\n`;
 }
 export async function bindProject(options) {
-    const target = resolveBindTarget(options.startDir);
-    const current = readProjectWorkspaceId(options.startDir);
+    const target = resolveBindTarget(options.startDir, options.homeDir, options.explicitRoot);
+    const current = readProjectWorkspaceId(options.startDir, options.homeDir);
     const currentWorkspace = current.kind === 'workspace' ? current.workspaceId : undefined;
     const report = (data, lines) => {
         if (options.json)
@@ -114,7 +143,7 @@ export async function bindProject(options) {
     // Status only.
     if (!options.unbind && options.workspace === undefined) {
         const capture = describeCaptureForBinding(currentWorkspace, options.baseDir);
-        report({ bound: Boolean(currentWorkspace), workspaceId: currentWorkspace ?? null, file: current.kind === 'none' ? null : current.configPath,
+        report({ bound: Boolean(currentWorkspace), workspaceId: currentWorkspace ?? null, file: current.configPath ?? null,
             invalid: current.kind === 'invalid', capture: capture ?? null }, [
             current.kind === 'workspace'
                 ? `This project is bound to workspace ${current.workspaceId} (${current.configPath}).`
@@ -125,11 +154,21 @@ export async function bindProject(options) {
         ]);
         return current.kind === 'invalid' ? CLI_EXIT_CODES.CONFIGURATION_ERROR : CLI_EXIT_CODES.SUCCESS;
     }
+    if (target.requiresExplicitRoot && !options.explicitRoot)
+        refuseImplicitTarget(target);
+    if (options.explicitRoot && !fs.statSync(path.dirname(target.filePath), { throwIfNoEntry: false })?.isDirectory()) {
+        throw new CliConfigurationError(`--root ${path.dirname(target.filePath)} is not an existing directory.`);
+    }
     const existing = target.exists ? readBindingObject(target.filePath) : undefined;
     let nextValue;
     if (options.unbind) {
         if (!existing || !('workspaceId' in existing.value)) {
-            report({ changed: false, bound: false, file: existing ? target.filePath : null }, ['This project has no workspace binding; nothing changed.']);
+            // Only `--root <dir>` names a file other than the governing one: a
+            // directory below a bound one inherits that binding.
+            const inherited = currentWorkspace && current.configPath !== target.filePath ? current.configPath : undefined;
+            report({ changed: false, bound: Boolean(inherited), file: existing ? target.filePath : null, inheritedFrom: inherited ?? null }, [inherited
+                    ? `${path.dirname(target.filePath)} has no binding of its own; it inherits workspace ${currentWorkspace} from ${inherited}. Nothing changed. To remove that binding, run \`brainmcp unbind --root ${path.dirname(inherited)}\`.`
+                    : 'This project has no workspace binding; nothing changed.']);
             return CLI_EXIT_CODES.SUCCESS;
         }
         const rest = { ...existing.value };

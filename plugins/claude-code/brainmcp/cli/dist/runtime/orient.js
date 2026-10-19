@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { ANSWER_GROUNDING_BRIEF_GUIDANCE, WORKSPACE_INFERENCE_GUIDANCE } from '../agent-config.js';
 import { apiPathSegment } from '../api-client.js';
@@ -225,11 +226,81 @@ export class OrientRequestsFailedError extends Error {
 export function selectWorkspaceOrientationMessage() {
     return `Companion orientation has no resolved workspace. Continue through the host brain_* tools. ${WORKSPACE_INFERENCE_GUIDANCE}`;
 }
-/** Resolve only the nearest project policy file; malformed/symlinked files fail closed. */
-export function readProjectWorkspaceId(startDir) {
+/**
+ * Resolve only the nearest project policy file; malformed/symlinked files fail
+ * closed. A file with no `workspaceId` key binds nothing (`unbind` keeps its
+ * other keys, such as a capture opt-out, which capture still honors); only a
+ * `workspaceId` that is not a workspace UUID, or an unreadable file, is invalid.
+ *
+ * The walk stops at the nearest Git root (after reading a file there; for a
+ * linked worktree nested in its main checkout, the main checkout's root, see
+ * gitEntryEndsBindingWalk), as `brainmcp bind` resolves its target: a file above the repository belongs to
+ * another tree, so an unbound repository never inherits a parent directory's
+ * binding. Outside any Git repository the walk stops at the home directory
+ * (after reading a file there, which only an explicit `bind --root` writes).
+ */
+const MAX_GITDIR_POINTER_BYTES = 4 * 1024;
+/**
+ * Whether `dir`'s `.git` entry ends a binding walk. A `.git` directory (a
+ * repository root) does. A `.git` file is a gitdir pointer: a linked worktree
+ * nested inside its main checkout (for example `<repo>/.claude/worktrees/x`,
+ * whose gitdir is `<repo>/.git/worktrees/x`) belongs to that checkout, so the
+ * walk continues to the main repository root, which ends it. Any other
+ * pointer (a submodule, a worktree outside its checkout, an unreadable file)
+ * ends the walk here. `brainmcp bind` resolves its target with the same rule.
+ */
+export function gitEntryEndsBindingWalk(dir) {
+    const entry = path.join(dir, '.git');
+    const stat = fs.lstatSync(entry, { throwIfNoEntry: false });
+    if (!stat)
+        return false;
+    if (!stat.isFile() || stat.size > MAX_GITDIR_POINTER_BYTES)
+        return true;
+    try {
+        const match = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(fs.readFileSync(entry, 'utf8'));
+        if (!match)
+            return true;
+        const gitdir = path.resolve(dir, match[1]);
+        const worktrees = path.dirname(gitdir);
+        const mainGitDir = path.dirname(worktrees);
+        if (path.basename(worktrees) !== 'worktrees' || path.basename(mainGitDir) !== '.git')
+            return true;
+        if (!fs.lstatSync(mainGitDir, { throwIfNoEntry: false })?.isDirectory())
+            return true;
+        // Compared as canonical real paths: git records them resolved (/private/var
+        // on macOS), and the pointer's spelling may differ in case from the
+        // directory's on a case-insensitive volume.
+        const mainRoot = fs.realpathSync.native(path.dirname(mainGitDir));
+        const realDir = fs.realpathSync.native(dir);
+        return !realDir.startsWith(`${mainRoot}${path.sep}`);
+    }
+    catch {
+        return true;
+    }
+}
+/**
+ * Where a binding walk starts: the canonical real path of `dir` (the path
+ * itself when it cannot be resolved, for example after it was deleted). Git
+ * resolves a symlinked working directory to the tree it is in, and so does
+ * the walk: a linked worktree reached through a symlink outside its main
+ * checkout (`outer/wt-link` → `<repo>/.claude/worktrees/x`) belongs to that
+ * checkout, never to `outer`'s binding. `realpathSync.native` also gives the
+ * on-disk case, so the home-directory bound matches on a case-insensitive volume.
+ */
+export function bindingWalkStart(dir) {
+    const resolved = path.resolve(dir);
+    try {
+        return fs.realpathSync.native(resolved);
+    }
+    catch {
+        return resolved;
+    }
+}
+export function readProjectWorkspaceId(startDir, homeDir = os.homedir()) {
     if (!startDir)
         return { kind: 'none' };
-    let dir = path.resolve(startDir);
+    let dir = bindingWalkStart(startDir);
+    const home = bindingWalkStart(homeDir);
     for (let depth = 0; depth < 16; depth += 1) {
         const configPath = path.join(dir, '.brainmcp.json');
         if (fs.existsSync(configPath)) {
@@ -239,6 +310,10 @@ export function readProjectWorkspaceId(startDir) {
                     return { kind: 'invalid', configPath };
                 }
                 const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+                    return { kind: 'invalid', configPath };
+                if (!('workspaceId' in parsed))
+                    return { kind: 'none', configPath };
                 const workspaceId = typeof parsed.workspaceId === 'string' ? parsed.workspaceId.trim() : '';
                 return isWorkspaceUuid(workspaceId)
                     ? { kind: 'workspace', configPath, workspaceId }
@@ -248,6 +323,9 @@ export function readProjectWorkspaceId(startDir) {
                 return { kind: 'invalid', configPath };
             }
         }
+        // The Git root (a nested worktree's is its main checkout) and the home directory bound the walk.
+        if (gitEntryEndsBindingWalk(dir) || dir === home)
+            break;
         const parent = path.dirname(dir);
         if (parent === dir)
             break;

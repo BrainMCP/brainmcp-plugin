@@ -292,12 +292,15 @@ export function detectHostPlugin(host, lookup = {}) {
 /**
  * The enabled BrainMCP plugin that would duplicate what `init` writes at this
  * scope. A user-scope `init` serves every project, so only a user-scope plugin
- * replaces it; a project-scope `init` is replaced by any install that applies
- * to the project.
+ * replaces it. A project-scope `init` writes files a team commits (`.mcp.json`,
+ * `.claude/settings.json`, `.codex/config.toml`), so only a project- or
+ * local-scope install replaces it: one person's user-scope plugin must not
+ * strip them for teammates who lack it. For that person, the committed hooks
+ * still stand aside while the plugin's hooks run (`managedHookYieldsToPlugin`).
  */
 export function pluginReplacingInit(host, scope, lookup) {
     const status = detectHostPlugin(host, lookup);
-    return status.installs.find((install) => install.enabled && (scope === 'project' || install.scope === 'user'));
+    return status.installs.find((install) => install.enabled && (scope === 'project') === (install.scope !== 'user'));
 }
 export function describePluginInstall(host, install) {
     const label = host === 'claude-code' ? 'Claude Code' : 'Codex';

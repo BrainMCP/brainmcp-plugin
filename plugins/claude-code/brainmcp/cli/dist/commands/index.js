@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
-import { BRAIN_BOOTSTRAP_PROMPT, BRAIN_DOCS_URL, BRAIN_MCP_ENDPOINT, BRAIN_MCP_INITIAL_SCOPES, BRAIN_OAUTH_AUTH_METADATA_CANONICAL_URL, BRAIN_OAUTH_AUTH_METADATA_URL, BRAIN_OAUTH_ISSUER, BRAIN_OAUTH_RESOURCE_METADATA_COMPAT_URL, BRAIN_OAUTH_RESOURCE_METADATA_URL, BRAINMCP_CLI_CLIENTS, BRAINMCP_GLOBAL_CLIENTS, MCP_OAUTH_CLIENT_IDS, buildBrainmcpDoctorCommand, buildBrainmcpInitCommand, buildBrainVerificationPrompt, GUIDANCE_VERSION, } from '../agent-config.js';
+import { BRAIN_BOOTSTRAP_PROMPT, BRAIN_DOCS_URL, BRAIN_MCP_ENDPOINT, BRAIN_MCP_INITIAL_SCOPES, BRAIN_OAUTH_AUTH_METADATA_CANONICAL_URL, BRAIN_OAUTH_AUTH_METADATA_URL, BRAIN_OAUTH_ISSUER, BRAIN_OAUTH_RESOURCE_METADATA_COMPAT_URL, BRAIN_OAUTH_RESOURCE_METADATA_URL, BRAINMCP_CLI_CLIENTS, BRAINMCP_CLI_PACKAGE_SPEC, BRAINMCP_GLOBAL_CLIENTS, MCP_OAUTH_CLIENT_IDS, buildBrainmcpDoctorCommand, buildBrainmcpInitCommand, buildBrainVerificationPrompt, GUIDANCE_VERSION, } from '../agent-config.js';
 import { clientLabel, guidancePreamble, renderGuidance, resolveWorkspace, targetFor, describeAntigravityServerConfig, } from '../lib/config.js';
 import { applyChanges, exists, readText, renderDiff, toAbsolute } from '../lib/files.js';
+import { BACKUP_MAX_AGE_MS, BACKUP_MAX_PER_FILE, findLegacyBackups, getBackupsDir } from '../lib/backups.js';
 import { splitTomlSections, parseJsonc, removeJsoncPath, removeJsonServer, removeMarkdownBlock, removeTomlBlock, upsertJsoncPath, upsertJsonServer, upsertMarkdownBlock, upsertTomlBlock } from '../lib/managed.js';
 import { checkCredentialHealth, checkRuntimeDrift, checkConsentPreferences, checkQueueStatus, checkCompanionApiTarget } from '../runtime/doctor-checks.js';
 import { checkProjectBinding } from './bind.js';
@@ -13,7 +14,7 @@ import { CliConfigurationError, isWorkspaceUuid } from '../lib/cli-contracts.js'
 import { RequestDeadlineError, withRequestDeadline } from '../lib/http.js';
 import { cliPackageVersion, getRuntimeShimPath, getVersionedRuntimePath, loadPackagedRuntimeBundle, renderRuntimeShim, } from '../runtime/installer.js';
 import { managedHookEvents, managedHookPositions, managedNonNudgeHookEvents, removeClaudeManagedHooks, removeCodexManagedHooks, removeCursorManagedHooks, removeVsCodeManagedHooks, upsertClaudeManagedHooks, upsertClaudeNudgeHooks, upsertCodexManagedHooks, upsertCursorManagedHooks, upsertVsCodeManagedHooks, } from '../hooks/managed-hooks.js';
-import { codexManagedHookTrust, describePluginInstall, detectHostPlugin, isPluginHost, PLUGIN_HOOK_EVENTS, pluginReplacingInit, pluginRunsAllHooks, pluginRunsHook, } from '../lib/host-plugins.js';
+import { claudeConfigDir, codexManagedHookTrust, describePluginInstall, detectHostPlugin, isPluginHost, PLUGIN_HOOK_EVENTS, pluginReplacingInit, pluginRunsAllHooks, pluginRunsHook, } from '../lib/host-plugins.js';
 /**
  * Deadline for each public discovery probe in `doctor`, body read included. A
  * silent or trickling endpoint fails its check instead of stalling the command.
@@ -146,7 +147,7 @@ function renderSetupNextSteps(clients, scope, workspace) {
         ...doctorCommands,
         `Guide: ${BRAIN_DOCS_URL}/quickstart`,
         '',
-        'Safe to rerun: init restores the selected release defaults for the reserved brain server entry and BrainMCP-managed instructions. It preserves unrelated servers and text outside shared managed blocks, and backs up changed existing files.',
+        'Safe to rerun: init restores the selected release defaults for the reserved brain server entry and BrainMCP-managed instructions. It preserves unrelated servers and text outside shared managed blocks, and backs up changed existing files, except ones clean in Git (into ~/.brainmcp/backups, or $BRAINMCP_HOME/backups).',
         'No API keys or OAuth secrets were written to configuration files.',
     ].join('\n');
 }
@@ -174,12 +175,6 @@ export async function doctor(options) {
     const config = await readText(target.configPath);
     const guidance = await readText(target.guidancePath);
     const home = options.home ?? homedir();
-    // An enabled plugin supplies the MCP entry and hooks itself; init's own copy
-    // would load Brain twice.
-    const plugin = isPluginHost(client)
-        ? detectHostPlugin(client, { home, env: options.env ?? process.env, root: options.root }).active
-        : undefined;
-    const pluginOwnsConfig = plugin !== undefined && (config === undefined || !hasBrainServerConfig(config, target));
     const hookFile = target.hookPath
         ? resolveHookFilePath(target.hookPath, { scope: options.scope, home, root: options.root })
         : undefined;
@@ -192,6 +187,30 @@ export async function doctor(options) {
         hookJson = undefined;
     }
     const managedEvents = managedHookEvents(hookJson);
+    let hasBrainEntry;
+    try {
+        hasBrainEntry = config !== undefined && hasBrainServerConfig(config, target);
+    }
+    catch {
+        // Unparseable: it may hold an entry; the syntax check below reports it.
+        hasBrainEntry = true;
+    }
+    const hasManagedGuidance = guidance !== undefined && /brainmcp:managed:(?:start|end)/.test(guidance);
+    // An enabled plugin supplies the MCP entry and hooks itself; init's own copy
+    // would load Brain twice. Doctor yields to the same plugin init does, so a
+    // user-scope plugin never asks to strip a project's committed setup.
+    const pluginLookup = { home, env: options.env ?? process.env, root: options.root };
+    const replacingInit = isPluginHost(client) ? pluginReplacingInit(client, options.scope, pluginLookup) : undefined;
+    const activePlugin = isPluginHost(client) && !replacingInit ? detectHostPlugin(client, pluginLookup).active : undefined;
+    // A user-scope plugin serves every project, so a project init never touched is
+    // a plugin-only setup, not a broken one; only a partial project setup fails.
+    const pluginOnlyProject = options.scope === 'project' && activePlugin?.scope === 'user' &&
+        !hasBrainEntry && managedEvents.length === 0 && !hasManagedGuidance;
+    const plugin = replacingInit ?? (pluginOnlyProject ? activePlugin : undefined);
+    const otherPlugin = plugin ? undefined : activePlugin;
+    const pluginOwnsConfig = plugin !== undefined && !hasBrainEntry;
+    // The plugin's using-brainmcp skill stands in for guidance init never wrote.
+    const pluginCoversGuidance = plugin !== undefined && !hasManagedGuidance;
     // Codex runs a hook from hooks.json only after the user trusts it, init's own
     // included; file presence alone does not mean a hook runs.
     const codexTrust = client === 'codex' && hookFile && managedEvents.length > 0
@@ -203,7 +222,7 @@ export async function doctor(options) {
     ].filter(Boolean).join('; ');
     if (plugin && isPluginHost(client)) {
         const repairCommand = buildBrainmcpInitCommand({ client, scope: options.scope });
-        checks.push(['host plugin', true, `${describePluginInstall(client, plugin)} provides the brain MCP server and hooks`]);
+        checks.push(['host plugin', true, `${describePluginInstall(client, plugin)} provides the brain MCP server and hooks${pluginOnlyProject ? ' (plugin-only; project scope not configured)' : ''}`]);
         checks.push([
             'single brain MCP source',
             pluginOwnsConfig,
@@ -250,6 +269,15 @@ export async function doctor(options) {
         }
     }
     else {
+        if (otherPlugin && isPluginHost(client)) {
+            // An untouched project passes as plugin-only above; a project setup missing its entry or guidance is partial.
+            const partial = options.scope === 'project' && otherPlugin.scope === 'user' && (!hasBrainEntry || !hasManagedGuidance);
+            checks.push(['host plugin', true, [
+                    `${describePluginInstall(client, otherPlugin)} also loads brain; init does not yield to it at ${options.scope} scope, so doctor checks the ${options.scope}-scope setup init writes`,
+                    managedEvents.length > 0 ? " (init's hooks stand aside while the plugin's run)" : '',
+                    partial ? `; this project has only part of it: preview ${buildBrainmcpInitCommand({ client, scope: options.scope })} to complete it, or ${brainmcpRemoveCommand(client, options.scope)} to rely on the plugin alone` : '',
+                ].join('')]);
+        }
         checks.push(['configuration placement', config !== undefined, config ? target.configPath : `missing ${target.configPath}`]);
         if (codexTrust) {
             const blocked = trustDetail(codexTrust);
@@ -262,9 +290,9 @@ export async function doctor(options) {
             ]);
         }
     }
-    checks.push(['guidance placement', guidance !== undefined || plugin !== undefined, guidance
-            ? target.guidancePath
-            : plugin ? `no managed guidance at ${target.guidancePath}; the plugin's using-brainmcp skill covers it` : `missing ${target.guidancePath}`]);
+    checks.push(['guidance placement', guidance !== undefined || plugin !== undefined, pluginCoversGuidance
+            ? `no managed guidance at ${target.guidancePath}; the plugin's using-brainmcp skill covers it`
+            : guidance ? target.guidancePath : `missing ${target.guidancePath}`]);
     if (config !== undefined && !pluginOwnsConfig) {
         try {
             if (target.format === 'jsonc') {
@@ -300,7 +328,7 @@ export async function doctor(options) {
             checks.push(['configuration syntax and endpoint', false, error instanceof Error ? error.message : String(error)]);
         }
     }
-    if (guidance !== undefined) {
+    if (guidance !== undefined && !pluginCoversGuidance) {
         const occurrences = (guidance.match(/brainmcp:managed:start/g) ?? []).length;
         const normalizedGuidance = guidance.replace(/\r\n/g, '\n');
         const ends = (guidance.match(/brainmcp:managed:end/g) ?? []).length;
@@ -433,7 +461,7 @@ export async function doctor(options) {
         }),
     ];
     checks.push(...await Promise.all(networkChecks));
-    const brainHome = options.home ? join(options.home, '.brainmcp') : getBrainHome();
+    const brainHome = brainHomeFor(options);
     const credCheck = await checkCredentialHealth(brainHome, { probeVault: !options.home });
     checks.push([credCheck.name, credCheck.passed, credCheck.detail]);
     if (plugin) {
@@ -450,6 +478,17 @@ export async function doctor(options) {
     checks.push([queueCheck.name, queueCheck.passed, queueCheck.detail]);
     if (options.scope === 'project')
         checks.push(checkProjectBinding(options.root, brainHome));
+    // Informational: releases through 0.1.38 left `<file>.brainmcp.bak-*` copies
+    // beside each changed file. They are the user's files, so nothing deletes them.
+    const legacyBackups = await findLegacyBackups([target.configPath, target.guidancePath, hookFile]);
+    if (legacyBackups.length > 0) {
+        const shown = legacyBackups.slice(0, 5);
+        checks.push([
+            'legacy backups',
+            true,
+            `${legacyBackups.length} .brainmcp.bak-* ${legacyBackups.length === 1 ? 'copy' : 'copies'} from an earlier release beside the configuration: ${shown.join(', ')}${legacyBackups.length > shown.length ? `, and ${legacyBackups.length - shown.length} more` : ''}. BrainMCP no longer writes or deletes these; new backups go to ${getBackupsDir(brainHome)} (pruned after ${BACKUP_MAX_AGE_MS / 86_400_000} days, at most ${BACKUP_MAX_PER_FILE} per file). Delete them once you no longer need them`,
+        ]);
+    }
     for (const [name, passed, detail] of checks)
         options.output(`${passed ? '✓' : '✗'} ${name}: ${detail}`);
     if (checks.some(([, passed]) => !passed))
@@ -493,6 +532,10 @@ async function inspectOtherMcpConfigScope(options, client) {
         };
     }
 }
+/** `remove` as an npx user can run it, like the init and doctor commands other messages print. */
+function brainmcpRemoveCommand(client, scope) {
+    return `npx --yes ${BRAINMCP_CLI_PACKAGE_SPEC} remove --client ${client} --scope ${scope}`;
+}
 async function assertSingleMcpConfigScope(options, clients) {
     for (const client of clients) {
         if (!requiresSingleMcpConfigScope(client))
@@ -505,7 +548,7 @@ async function assertSingleMcpConfigScope(options, clients) {
             throw new CliConfigurationError(`Cannot inspect the existing ${clientLabel(client)} ${otherScope}-scope configuration at ${duplicate.path}: ${duplicate.error}`);
         }
         throw new CliConfigurationError(`Brain is already configured for ${clientLabel(client)} at ${duplicate.path} (${otherScope} scope). ` +
-            `Keep it in exactly one scope: run \`brainmcp remove --client ${client} --scope ${otherScope} --yes\`, then retry.`);
+            `Keep it in exactly one scope: run \`${brainmcpRemoveCommand(client, otherScope)} --yes\`, then retry.`);
     }
 }
 function hasBrainServerConfig(config, target) {
@@ -723,7 +766,7 @@ async function plannedHookChanges(options, client, target, mode) {
     if (!bundle) {
         throw new CliConfigurationError('The packaged BrainMCP hook runtime is missing. Reinstall or rebuild the CLI before enabling hooks.');
     }
-    const brainHome = options.home ? join(options.home, '.brainmcp') : getBrainHome();
+    const brainHome = brainHomeFor(options);
     const version = cliPackageVersion();
     const runtimePath = getVersionedRuntimePath(version, brainHome);
     // Hook commands name the version-independent shim, so they stay byte-identical
@@ -837,6 +880,21 @@ function resolveTarget(options, target) {
             rootKey: target.configRootKey,
         };
     }
+    if (options.scope === 'user' && target.client === 'claude-code') {
+        // With CLAUDE_CONFIG_DIR set, Claude Code keeps `.claude.json` in that
+        // directory too, beside CLAUDE.md and settings.json; plugin detection and
+        // the plugin hook's guidance check read the same directory.
+        const env = options.env ?? process.env;
+        const configDir = claudeConfigDir({ home, env });
+        return {
+            ...target,
+            configPath: join(env.CLAUDE_CONFIG_DIR?.trim() ? configDir : home, '.claude.json'),
+            guidancePath: join(configDir, 'CLAUDE.md'),
+            hookPath: join(configDir, 'settings.json'),
+            format: target.configFormat,
+            rootKey: target.configRootKey,
+        };
+    }
     const base = options.scope === 'user' ? home : options.root;
     return {
         ...target,
@@ -922,20 +980,51 @@ function renderRuntimeSummary(change) {
     const sha256 = createHash('sha256').update(content, 'utf8').digest('hex');
     return `+++ ${change.path} (${change.before === undefined ? 'new' : 'updated'} BrainMCP hook runtime, ${bytes} bytes, sha256 ${sha256})`;
 }
+/**
+ * Every planned JSON/JSONC file must still parse. The edits keep the user's
+ * comments and formatting, so a slip there would otherwise write a host config
+ * that the host, and every later `init`, `doctor` and `remove`, cannot read.
+ */
+export function assertPlannedJsonParses(changes) {
+    for (const change of changes) {
+        if (change.after === undefined || !/\.jsonc?$/i.test(change.path))
+            continue;
+        try {
+            parseJsonc(change.after);
+        }
+        catch {
+            throw new CliConfigurationError(`Refusing to write ${change.path}: the planned edit is not valid JSON/JSONC. No file was changed.`);
+        }
+    }
+}
 async function previewAndApply(changes, options) {
     const changed = changes.filter((change) => change.before !== change.after);
     if (!changed.length) {
         options.output('BrainMCP configuration is already up to date.');
         return;
     }
+    assertPlannedJsonParses(changed);
     options.output(changed.map((change) => change.summarizePreview ? renderRuntimeSummary(change) : renderDiff(change)).join('\n\n'));
     if (!options.yes && !(await options.confirm?.('Apply these changes?') ?? false)) {
         throw new Error('Aborted. Re-run with --yes after reviewing the preview.');
     }
-    const backups = await applyChanges(changed);
-    options.output(backups.length
-        ? `Applied changes with atomic per-file writes. Backups: ${backups.join(', ')}`
-        : 'Applied changes with atomic per-file writes.');
+    const brainHome = brainHomeFor(options);
+    const { backups, cleanInGit } = await applyChanges(changed, { brainHome });
+    options.output(['Applied changes with atomic per-file writes.', ...renderBackupReport(backups, cleanInGit, brainHome)].join('\n'));
+}
+/** The brain home init, doctor and remove use: `<home>/.brainmcp` under a test home, else BRAINMCP_HOME or `~/.brainmcp`. */
+function brainHomeFor(options) {
+    return options.home ? join(options.home, '.brainmcp') : getBrainHome();
+}
+export function renderBackupReport(backups, cleanInGit, brainHome) {
+    const lines = [];
+    if (backups.length) {
+        lines.push(`Backups (to undo, copy one back over its file; kept in ${getBackupsDir(brainHome)} for ${BACKUP_MAX_AGE_MS / 86_400_000} days, at most ${BACKUP_MAX_PER_FILE} per file):`, ...backups.map(({ path, backup }) => `  ${path} <- ${backup}`));
+    }
+    if (cleanInGit.length) {
+        lines.push('Not backed up because they were clean in Git (to undo, restore the committed version with `git restore <file>`):', ...cleanInGit.map((path) => `  ${path}`));
+    }
+    return lines;
 }
 export * from './auth.js';
 export * from './dispatch.js';
