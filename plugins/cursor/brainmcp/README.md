@@ -1,6 +1,6 @@
 # brainMCP for Cursor
 
-Version 0.1.40 (guidance 2026.10.15). Shared, reviewable project memory for coding agents: Cursor agents orient from your Brain workspace before work and propose durable learnings back as reviewable changes.
+Version 0.1.41 (guidance 2026.10.19). Shared, reviewable project memory for coding agents: Cursor agents orient from your Brain workspace before work and propose durable learnings back as reviewable changes.
 
 ## Install
 

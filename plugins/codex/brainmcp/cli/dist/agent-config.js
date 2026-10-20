@@ -60,7 +60,7 @@ export const BRAIN_MCP_INITIAL_SCOPES = [
     'workflows:read',
 ];
 /** Bump when always-on guidance text changes in a way clients should refresh. */
-export const GUIDANCE_VERSION = '2026.10.15';
+export const GUIDANCE_VERSION = '2026.10.19';
 /** Answer grounding is shared by installed guidance, MCP surfaces, and compact hooks. */
 export const ANSWER_GROUNDING_GUIDANCE = [
     'Ground material factual claims in source content you actually read, current code or observed tool/test results. Attribute unchecked Brain statements to their source; stored or applied does not mean independently verified.',
@@ -429,7 +429,7 @@ export const OVERVIEW_ACTIVE_WORKSPACE_WORKFLOW = OVERVIEW_CANONICAL_WORKFLOW.fi
 export const PROJECT_INSTRUCTION_OBLIGATIONS = [
     {
         full: 'Connection honesty: if brain_* tools are unavailable or authorization is required, say that no live brain context was loaded, help the user reconnect/login, and continue only with clearly labeled local context. Never pretend Brain was read.',
-        compact: 'Connection honesty: if brain_* tools are unavailable or authorization is required, say that no live brain context was loaded, help the user reconnect/login, and label any local context. Never pretend Brain was read.',
+        compact: 'No live Brain connection? Say so, help reconnect/login, and label local context. Never pretend Brain was read.',
         essential: 'No brain_* tools or sign-in? Say no live Brain context was loaded; never pretend Brain was read.',
     },
     {
@@ -465,7 +465,7 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
     {
         full: 'Before a related proposal, apply rejection guidance from learningSignals.recentDecisions. Exact duplicate creates can be blocked; update or reuse the matched item instead of retrying.',
         compact: 'Before a related proposal, apply learningSignals.recentDecisions. A blocked duplicate create means update or reuse the matched item, not retry.',
-        essential: 'Apply learningSignals.recentDecisions; update or reuse a blocked duplicate, never retry it.',
+        essential: 'Apply learningSignals.recentDecisions; reuse/update a blocked duplicate, never retry it.',
     },
     {
         full: 'After meaningful work, propose only genuinely new durable project knowledge (decisions, architecture, conventions, fixes, and operational lessons). Never store secrets, credentials, personal data, raw transcripts, or temporary build/log output. If nothing reusable changed, do not propose.',
@@ -510,7 +510,7 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
     {
         full: SECTOR_GUIDANCE,
         compact: 'Sectors classify Cores and Neurons; they are not node types, parent Cores, or tags. Discover real IDs from brain://workspace/{workspaceId}/sectors before filtering by sectorIds. Unassigned means no effective primary; use unassignedOnly=true alone.',
-        essential: 'Sectors classify Cores/Neurons; real ids: brain://workspace/{workspaceId}/sectors.',
+        essential: 'Sectors: brain://workspace/{workspaceId}/sectors.',
     },
     {
         full: GRAPH_WRITE_GUIDANCE,
@@ -521,6 +521,11 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
         full: `Context Paths: ${CONTEXT_PATH_BRIEF_GUIDANCE}`,
         compact: 'Context Paths: call brain_context_path_create only when the user asks for a saved explanation link and the tool is advertised. Cite sources by kind and role (a workspace Skill is workspace_skill plus the node id), never pad steps or sources, and mark a source read while writing as later_review. The link opens only for its creator; saved content is historical. A pasted context-path step reference is a correction handoff: read it and follow its stated intention.',
         essential: 'brain_context_path_create only when asked for a saved explanation link.',
+    },
+    {
+        full: 'Files: when advertised, use brain_file_upload then the returned curl command then brain_file_attach. Inline contentText/contentBase64 is limited to 256 KiB decoded. Use a stable idempotencyKey for attachment retries. brain_file_read returns a private short-lived download URL, paged text, small images and a raw-byte resource; never save transfer URLs in Brain. assets:read/assets:write require incremental consent. Attaching and detach_asset stay proposals; an upload alone is not attached. Encrypted-secret node files cannot be read by agents.',
+        compact: 'Files when advertised: upload, curl, attach (inline up to 256 KiB); read pages. Use stable keys; keep transfer URLs private.',
+        essential: 'Files: upload/curl/attach; private URLs.',
     },
     {
         full: 'Use brain_session_digest only as a disclosed fallback when the user explicitly asks to capture unstructured session learnings — never as an automatic dump of every session.',
