@@ -1,15 +1,15 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ANSWER_GROUNDING_BRIEF_GUIDANCE, WORKSPACE_INFERENCE_GUIDANCE } from '../agent-config.js';
+import { WORKSPACE_INFERENCE_GUIDANCE } from '../agent-config.js';
 import { apiPathSegment } from '../api-client.js';
 import { accessTokenExpiresSoon, CompanionReauthRequiredError } from '../lib/api-client.js';
 import { OAuthRefreshFailedError } from '../lib/oauth-client.js';
 import { COMPANION_WORKSPACES_PATH } from '../lib/endpoints.js';
-import { isWorkspaceUuid } from '../lib/cli-contracts.js';
+import { isWorkspaceUuid, normalizeWorkspaceId } from '../lib/cli-contracts.js';
 import { resolveStateDir } from './storage.js';
 import { logRuntimeEvent } from './diagnostics.js';
-export const ORIENT_CONTEXT_MAX_CHARS = 2_400;
+export const ORIENT_CONTEXT_MAX_CHARS = 2_700;
 /** `mustSurfaceToUser` actions shown in the hook packet, one bounded line each. */
 const ORIENT_MAX_SURFACED_ACTIONS = 3;
 const ORIENT_SURFACED_ACTION_MAX_CHARS = 240;
@@ -81,10 +81,14 @@ export function resolveOrientWorkspaceId(creds, listing) {
     return { workspaceId: null, reason: 'select' };
 }
 const ORIENT_PACKET_FIRST_LINE = 'BrainMCP orientation (no user prompt was sent).';
+/**
+ * The packet always arrives beside Brain's always-on guidance (init's managed block, or the
+ * plugin's compact block in the same hook string), which already covers answer grounding and
+ * write-back. Repeating them here used most of the budget, so the packet carries workspace details.
+ */
 const ORIENT_PACKET_HEADER = [
     ORIENT_PACKET_FIRST_LINE,
-    ANSWER_GROUNDING_BRIEF_GUIDANCE,
-    'This hook packet is bounded; call brain_workspace_overview for full Rules and current project context before dependent work. Clipped or omitted workspace details are incomplete.',
+    'Workspace details only; the Brain guidance covers grounding and saving. This packet is bounded: call brain_workspace_overview for full Rules and current context before dependent work. Clipped or omitted details are incomplete.',
 ].join('\n');
 function isRecord(value) {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -94,6 +98,65 @@ function clipContext(text, maxChars) {
         return text;
     // Avoid splitting a UTF-16 surrogate pair at the packet or excerpt boundary.
     return `${text.slice(0, maxChars - 1).replace(/[\uD800-\uDBFF]$/, '')}…`;
+}
+/** Rule bodies (local and parent together) the hook packet shows in full or as excerpts. */
+const ORIENT_MAX_RULE_BODIES = 5;
+const ORIENT_RULE_BODY_MAX_CHARS = 400;
+function ruleLine(label, rawBody) {
+    const body = rawBody.trim();
+    return body.length > ORIENT_RULE_BODY_MAX_CHARS
+        ? `${label} excerpt (incomplete): ${clipContext(body, ORIENT_RULE_BODY_MAX_CHARS + 1)}`
+        : `${label}: ${body}`;
+}
+const PARENT_STATUS_TEXT = {
+    available: 'available, read-only',
+    needs_approval: 'needs approval for this connection',
+    // The API answers every CLI companion with no_access: the companion itself never reads parent context.
+    no_access: 'not read by this companion',
+    paid_plan_required: 'paused until the paid plan is renewed',
+    unavailable: 'unavailable',
+    feature_unavailable: 'shared context is turned off',
+};
+/**
+ * The overview's `parentContext` block (only for a workspace with an attached parent): one
+ * summary line, plus the parent's always-on Rule bodies for the shared Rule bound.
+ */
+function readParentContext(value) {
+    if (!isRecord(value) || typeof value.status !== 'string')
+        return undefined;
+    const name = typeof value.name === 'string' && value.name.trim() ? `"${clipContext(value.name.trim(), 80)}"` : 'a parent workspace';
+    const statusText = PARENT_STATUS_TEXT[value.status] ?? 'status unknown';
+    const listed = Array.isArray(value.rules) ? value.rules : [];
+    const rules = listed.filter((rule) => isRecord(rule) && typeof rule.body === 'string' && Boolean(rule.body.trim())).map((rule) => rule.body);
+    const parts = [`Parent context: this workspace inherits from ${name} (${statusText}).`];
+    // A complete page says so; a page with more Rules, or with bodies left out, is never "all of them".
+    const page = isRecord(value.rulesPage) ? value.rulesPage : undefined;
+    const pageIncomplete = page?.complete === false || page?.hasMore === true;
+    if (value.status === 'available') {
+        const total = typeof page?.totalCount === 'number' && page.totalCount > rules.length ? page.totalCount : undefined;
+        parts.push(pageIncomplete || rules.length !== listed.length
+            ? `Parent Rules are incomplete here (${rules.length} listed${total ? ` of ${total}` : ''}): follow the listed ones like this workspace's Rules and read the rest through brain_workspace_overview parentContext (rulesPage.continuation, bodyRead) before Rule-dependent work.`
+            : rules.length
+                ? `${rules.length} parent Rule${rules.length === 1 ? '' : 's'} apply: follow them like this workspace's Rules.`
+                : 'No parent Rules apply.');
+        parts.push('Write only to this workspace, never to the parent.');
+    }
+    else if (value.status === 'no_access') {
+        // The companion's own refusal, not the person's access: its fix would only repeat this line.
+        parts.push('The CLI companion never reads parent context, so parent Rules and knowledge are not in this packet. Agents connected over MCP read them once that connection is approved for the parent: check the host\'s brain_workspace_overview parentContext.');
+    }
+    else {
+        parts.push(value.status === 'paid_plan_required'
+            ? 'Parent Rules and knowledge were not loaded; do not retry through another tool.'
+            : 'Parent Rules and knowledge were not loaded for this companion connection; the host connection may differ, so check host brain_workspace_overview.');
+        const fix = isRecord(value.fix) && typeof value.fix.message === 'string' && value.fix.message.trim() ? value.fix : undefined;
+        if (fix) {
+            const where = typeof fix.dashboardPath === 'string' && fix.dashboardPath.startsWith('/') ? ` (dashboard: ${clipContext(fix.dashboardPath, 120)})` : '';
+            parts.push(`Fix: ${clipContext(String(fix.message).trim(), ORIENT_SURFACED_ACTION_MAX_CHARS)}${where}`);
+        }
+    }
+    return { summary: parts.join(' ').replace(/\s+/g, ' '), rules,
+        incomplete: rules.length !== listed.length || (value.status === 'available' && pageIncomplete) };
 }
 function formatOrientDetails(payload, expectedWorkspaceId) {
     const workspace = isRecord(payload) && isRecord(payload.workspace) ? payload.workspace : undefined;
@@ -141,28 +204,38 @@ function formatOrientDetails(payload, expectedWorkspaceId) {
     const items = Array.isArray(rules?.items) ? rules.items : [];
     const validRules = items.filter((rule) => isRecord(rule) && typeof rule.body === 'string' && Boolean(rule.body.trim()));
     const responseCap = isRecord(data.responseCap) ? data.responseCap : undefined;
+    const parent = readParentContext(data.parentContext);
     // `rules.status` is optional ('ok' | 'unavailable'); older servers omit it. An
     // unavailable Rule set is never an empty one, even with zero items.
     const rulesUnavailable = rules?.status === 'unavailable';
     if (rulesUnavailable) {
         lines.push('Brain Rules could not be loaded; do not assume this workspace has no Rules. Retry brain_workspace_overview before dependent work.');
     }
+    // Local and parent Rule bodies share one bound, local first.
     if (!rules || !Array.isArray(rules.items) || validRules.length !== items.length
-        || items.length > 3 || rules.truncated === true || rulesUnavailable
+        || items.length + (parent?.rules.length ?? 0) > ORIENT_MAX_RULE_BODIES || rules.truncated === true || rulesUnavailable
         || (Array.isArray(rules.omittedRules) && rules.omittedRules.length > 0)
+        || parent?.incomplete === true
         || responseCap?.applied === true) {
         lines.push('Rules or other context are incomplete; recover omitted content through brain_workspace_overview and exact reads.');
     }
-    for (const rule of validRules.slice(0, 3)) {
-        const body = rule.body.trim();
-        lines.push(body.length > 280 ? `Rule excerpt (incomplete): ${clipContext(body, 281)}` : `Rule: ${body}`);
-    }
-    if (canWrite) {
-        lines.push(typeof data.writeBackHint === 'string' && data.writeBackHint.trim()
-            ? data.writeBackHint.trim()
-            : 'During authorized project work, propose only new durable knowledge through available Brain tools. Honor read-only requests and workspace permissions.');
+    for (const rule of validRules.slice(0, ORIENT_MAX_RULE_BODIES))
+        lines.push(ruleLine('Rule', rule.body));
+    if (parent) {
+        lines.push(parent.summary);
+        for (const body of parent.rules.slice(0, Math.max(0, ORIENT_MAX_RULE_BODIES - validRules.length)))
+            lines.push(ruleLine('Parent Rule', body));
     }
     return lines.join('\n');
+}
+/**
+ * A child whose organization lost the paid plan its agents need: the API refuses agent reads of
+ * both the child and its parent. That is not an empty workspace or a request to sign in again.
+ */
+function paidPlanOrientation(error, workspaceId) {
+    if (!isRecord(error) || error.status !== 403 || error.code !== 'workspace_inheritance_paid_plan_required')
+        return undefined;
+    return `Workspace ${workspaceId}: agent access is paused because the organization that owns this workspace no longer has the paid plan its agents need. No workspace or parent knowledge was loaded. Do not retry through another tool; tell the user the owner can renew from the dashboard.`;
 }
 export function formatOrientAdditionalContext(payload) {
     return clipContext(`${ORIENT_PACKET_HEADER}\n${formatOrientDetails(payload)}`, ORIENT_CONTEXT_MAX_CHARS);
@@ -314,7 +387,7 @@ export function readProjectWorkspaceId(startDir, homeDir = os.homedir()) {
                     return { kind: 'invalid', configPath };
                 if (!('workspaceId' in parsed))
                     return { kind: 'none', configPath };
-                const workspaceId = typeof parsed.workspaceId === 'string' ? parsed.workspaceId.trim() : '';
+                const workspaceId = typeof parsed.workspaceId === 'string' ? normalizeWorkspaceId(parsed.workspaceId) : '';
                 return isWorkspaceUuid(workspaceId)
                     ? { kind: 'workspace', configPath, workspaceId }
                     : { kind: 'invalid', configPath };
@@ -423,7 +496,16 @@ export async function fetchSessionStartOrientation(input) {
     if (workspaceIds.length === 0)
         return selectWorkspaceOrientationMessage();
     const results = await Promise.allSettled(workspaceIds.map(async (workspaceId) => {
-        const payload = await input.apiClient.request(`/api/workspaces/${apiPathSegment(workspaceId)}/orient`, { timeoutMs: remainingMs(), signal: input.signal });
+        let payload;
+        try {
+            payload = await input.apiClient.request(`/api/workspaces/${apiPathSegment(workspaceId)}/orient`, { timeoutMs: remainingMs(), signal: input.signal });
+        }
+        catch (error) {
+            const paused = paidPlanOrientation(error, workspaceId);
+            if (paused)
+                return paused;
+            throw error;
+        }
         return formatOrientDetails(payload, workspaceId);
     }));
     const failures = results.map((result) => result.status === 'rejected' ? classifyOrientFailure(result.reason) : null);

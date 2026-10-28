@@ -1,5 +1,5 @@
 import { BRAIN_MCP_ENDPOINT, BRAINMCP_CLI_CLIENTS, GUIDANCE_VERSION, MCP_CLIENT_PROFILES, MCP_OAUTH_CLIENT_IDS, ANTIGRAVITY_RULES_FRONTMATTER, VSCODE_USER_INSTRUCTIONS_FRONTMATTER, buildCodexConfigToml, buildProjectInstructionBlock, renderCursorMdc, } from '../agent-config.js';
-import { isWorkspaceUuid } from './cli-contracts.js';
+import { isWorkspaceUuid, normalizeWorkspaceId } from './cli-contracts.js';
 export const BRAIN_ENDPOINT = BRAIN_MCP_ENDPOINT;
 export const CLIENT_IDS = BRAINMCP_CLI_CLIENTS;
 export function assertClientId(value) {
@@ -104,7 +104,7 @@ export const WORKSPACE_UUID_REQUIRED = '--workspace must be the workspace UUID, 
 export function resolveWorkspace(value) {
     if (value === undefined)
         return undefined;
-    const workspace = value.trim();
+    const workspace = normalizeWorkspaceId(value);
     if (!isWorkspaceUuid(workspace))
         throw new Error(WORKSPACE_UUID_REQUIRED);
     return workspace;

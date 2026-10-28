@@ -1,6 +1,6 @@
 # brainMCP for Codex
 
-Version 0.1.41 (guidance 2026.10.19). Shared, reviewable project memory for coding agents: Codex orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
+Version 0.1.42 (guidance 2026.10.28). Shared, reviewable project memory for coding agents: Codex orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
 
 ## Install
 
@@ -14,16 +14,16 @@ Restart Codex and trust the plugin hooks when asked (**Trust all and continue**,
 
 Hooks need Node.js 22 or newer on PATH. Not yet verified on Windows.
 
-Optional, for orientation hooks: sign in the bundled companion CLI with `node "${CODEX_HOME:-$HOME/.codex}/plugins/cache/brainmcp/brainmcp/0.1.41/cli/dist/index.js" login` (the `setup` skill has the details).
+Optional, for orientation hooks: sign in the bundled companion CLI with `node "${CODEX_HOME:-$HOME/.codex}/plugins/cache/brainmcp/brainmcp/0.1.42/cli/dist/index.js" login` (the `setup` skill has the details).
 
 ## What is inside
 
 - `.mcp.json`: the `brain` server with Brain's stable public `codex` OAuth client.
 - `skills/using-brainmcp` and `skills/setup`, available as `brainmcp:using-brainmcp` and `brainmcp:setup`.
 - `hooks/hooks.json`: SessionStart, UserPromptSubmit, PostToolUse, PreCompact, and SessionEnd. Hooks inject context; they cannot force a tool call.
-- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.41, unmodified and unbundled.
+- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.42, unmodified and unbundled.
 
-A plugin cannot write AGENTS.md, so every session start adds Brain's always-on guidance (guidance 2026.10.19, in compact form), signed in or not, once you trust the SessionStart hook. It leaves that out when the AGENTS.md in your Codex home (`~/.codex` or `CODEX_HOME`) already has the block `brainmcp init` writes for the same guidance version; a non-empty AGENTS.override.md there replaces AGENTS.md, as in Codex.
+A plugin cannot write AGENTS.md, so every session start adds Brain's always-on guidance (guidance 2026.10.28, in compact form), signed in or not, once you trust the SessionStart hook. It leaves that out when the AGENTS.md in your Codex home (`~/.codex` or `CODEX_HOME`) already has the block `brainmcp init` writes for the same guidance version; a non-empty AGENTS.override.md there replaces AGENTS.md, as in Codex.
 
 If you also ran `brainmcp init` for Codex, rerun it: with the plugin enabled it removes its own `[mcp_servers.brain]` table and hooks and keeps only its AGENTS.md guidance. A config.toml `brain` entry otherwise silently replaces the plugin's.
 

@@ -1,6 +1,6 @@
 import { cwd, stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
-import { BRAINMCP_CLI_PACKAGE_SPEC, BRAINMCP_GLOBAL_CLIENTS } from '../agent-config.js';
+import { BRAINMCP_CLI_PACKAGE_SPEC, BRAINMCP_GLOBAL_CLIENTS, BRAINMCP_PLUGIN_ID, BRAINMCP_PLUGIN_REPOSITORY, } from '../agent-config.js';
 import { CLI_EXIT_CODES, CliConfigurationError } from '../lib/cli-contracts.js';
 import { assertClientId, CLIENT_IDS, clientLabel, resolveWorkspace } from '../lib/config.js';
 import { OAuthGrantRejectedError } from '../lib/oauth-client.js';
@@ -15,8 +15,12 @@ import { runHookRuntimeCli } from '../runtime/index.js';
 import { captureStatus, captureEnable, captureDisable, captureNow, capturePurgeLocal, capturePurgePreview, } from './capture.js';
 export const HELP = `brainmcp — configure BrainMCP for agent projects and authenticate companion CLI
 
-Recommended setup (supported agents, all projects):
-  npx --yes ${BRAINMCP_CLI_PACKAGE_SPEC} init --all --scope user
+Recommended setup:
+  Claude Code and Codex: install the brainmcp plugin first.
+    claude plugin marketplace add ${BRAINMCP_PLUGIN_REPOSITORY} && claude plugin install ${BRAINMCP_PLUGIN_ID}
+    codex plugin marketplace add ${BRAINMCP_PLUGIN_REPOSITORY} && codex plugin add ${BRAINMCP_PLUGIN_ID}
+  Every supported agent, all projects (init writes only guidance where a plugin is enabled):
+    npx --yes ${BRAINMCP_CLI_PACKAGE_SPEC} init --all --scope user
 
 Usage:
   brainmcp init [--client <client>] [--workspace <uuid>] [--scope project|user] [--no-hooks] [--write-back-nudge] [--ignore-plugin] [--yes]
@@ -295,6 +299,8 @@ export async function dispatch(rawArgs, context = {}) {
                     openBrowser: context.openBrowser,
                     store: context.store,
                     oauthClient: context.oauthClient,
+                    apiClient: context.apiClient,
+                    runtimeHome: context.baseDir,
                 });
                 return CLI_EXIT_CODES.SUCCESS;
             case 'logout':
@@ -303,6 +309,7 @@ export async function dispatch(rawArgs, context = {}) {
                     output,
                     store: context.store,
                     oauthClient: context.oauthClient,
+                    runtimeHome: context.baseDir,
                 });
                 return CLI_EXIT_CODES.SUCCESS;
             case 'whoami': {
@@ -311,6 +318,7 @@ export async function dispatch(rawArgs, context = {}) {
                     output,
                     store: context.store,
                     apiClient: context.apiClient,
+                    runtimeHome: context.baseDir,
                 });
                 // Only a usable sign-in exits 0, so scripts can gate on `brainmcp whoami`.
                 return identity.status === 'authenticated' ? CLI_EXIT_CODES.SUCCESS : CLI_EXIT_CODES.AUTH_REQUIRED;
@@ -336,7 +344,8 @@ export async function dispatch(rawArgs, context = {}) {
                     result = confirmed
                         ? capturePurgeLocal({ baseDir: context.baseDir })
                         : {
-                            exitCode: CLI_EXIT_CODES.SUCCESS,
+                            // A declined preview is a general error (README exit codes).
+                            exitCode: CLI_EXIT_CODES.GENERAL_ERROR,
                             data: { purged: false, preview, message: 'Local capture purge cancelled; no files were deleted.' },
                         };
                 }

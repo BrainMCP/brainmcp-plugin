@@ -7,7 +7,7 @@ import { flushCaptureQueue, queueItemFailureClass, readCaptureStatus, MAX_CAPTUR
 import { SessionLockTimeoutError, withSessionLock } from '../runtime/lock.js';
 import { previewCapturePurge, purgeCaptureLocalState } from '../runtime/retention.js';
 import { loadMostRecentSessionLedger, queueSessionCapture, sessionSliceDigestId } from '../runtime/session.js';
-import { CLI_EXIT_CODES, isWorkspaceUuid, } from '../lib/cli-contracts.js';
+import { CLI_EXIT_CODES, isWorkspaceUuid, normalizeWorkspaceId, } from '../lib/cli-contracts.js';
 import { WORKSPACE_UUID_REQUIRED } from '../lib/config.js';
 import { ApiClient } from '../lib/api-client.js';
 import { createDefaultCredentialStore } from '../lib/credentials.js';
@@ -52,7 +52,7 @@ export function captureStatus(options) {
     return { exitCode: CLI_EXIT_CODES.SUCCESS, data };
 }
 export async function captureEnable(options) {
-    const explicitWorkspace = options?.workspace?.trim();
+    const explicitWorkspace = options?.workspace === undefined ? undefined : normalizeWorkspaceId(options.workspace);
     if (explicitWorkspace && !isWorkspaceUuid(explicitWorkspace)) {
         return {
             exitCode: CLI_EXIT_CODES.USAGE_ERROR,
@@ -530,7 +530,8 @@ export async function captureNow(options) {
 async function captureSessionSlice(options, getApiClient, requeueOnce) {
     const stateDir = options.baseDir;
     const prefs = readPreferences(options?.baseDir);
-    const workspaceId = (options?.workspace || prefs?.enabledWorkspaceId)?.trim();
+    const selectedWorkspace = options?.workspace || prefs?.enabledWorkspaceId;
+    const workspaceId = selectedWorkspace === undefined ? undefined : normalizeWorkspaceId(selectedWorkspace);
     const projectKey = captureProjectKey(options.cwd ?? process.cwd());
     const ledger = loadMostRecentSessionLedger(options?.baseDir, projectKey);
     const projectPolicy = readProjectCaptureRestrictions(options.cwd ?? process.cwd());

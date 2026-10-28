@@ -56,7 +56,7 @@ export async function init(options) {
     options.output(`BrainMCP configured for ${clientLabel(client)}.`);
     if (plugin)
         options.output(pluginInitNote(client, plugin, keepsNudgeBesidePlugin(options, client, plugin)));
-    options.output(renderSetupNextSteps([client], options.scope, workspace));
+    options.output(renderSetupNextSteps([client], options.scope, workspace, plugin ? [client] : []));
 }
 export async function initAll(options) {
     const workspace = resolveWorkspace(options.workspace);
@@ -70,7 +70,7 @@ export async function initAll(options) {
         if (plugin)
             options.output(pluginInitNote(client, plugin, keepsNudgeBesidePlugin(options, client, plugin)));
     });
-    options.output(renderSetupNextSteps(BRAINMCP_GLOBAL_CLIENTS, options.scope, workspace));
+    options.output(renderSetupNextSteps(BRAINMCP_GLOBAL_CLIENTS, options.scope, workspace, BRAINMCP_GLOBAL_CLIENTS.filter((_client, index) => plugins[index])));
 }
 /**
  * The enabled host plugin that already provides this client's MCP entry and
@@ -107,13 +107,14 @@ function pluginInitNote(client, plugin, keptNudge = false) {
     }
     return `${describePluginInstall(client, plugin)} provides the brain MCP server and lifecycle hooks, so init wrote only the managed guidance and removed any MCP entry or hooks it had written before. ${authenticate} Rerun with --ignore-plugin to keep init's own entry and hooks instead; they stand aside while the plugin's hooks run.`;
 }
-function renderSetupNextSteps(clients, scope, workspace) {
+/** `pluginClients`: the clients whose enabled host plugin provides the brain MCP server. */
+function renderSetupNextSteps(clients, scope, workspace, pluginClients = []) {
     const clientList = clients.map(clientLabel).join(', ');
     const doctorCommands = clients.map((client) => `   ${buildBrainmcpDoctorCommand({ client, scope, workspaceId: workspace })}`);
     const authorizationSteps = clients.map((client) => {
         switch (client) {
             case 'claude-code':
-                return '   - Claude Code: start a session, run /mcp, select brain, then choose Authenticate.';
+                return `   - Claude Code: start a session, run /mcp, select ${pluginClients.includes(client) ? 'plugin:brainmcp:brain' : 'brain'}, then choose Authenticate.`;
             case 'cursor':
                 return '   - Cursor: open Settings > Tools & MCP, select brain, then connect or authorize it.';
             case 'codex':
@@ -139,9 +140,9 @@ function renderSetupNextSteps(clients, scope, workspace) {
         `5. Verify with a read-only agent prompt (guidance ${GUIDANCE_VERSION}):`,
         `   ${buildBrainVerificationPrompt({ workspaceId: workspace })}`,
         '   Confirm the dashboard Connect view shows Agent seen after a successful authenticated tool call.',
-        '6. If the workspace is empty, copy and paste this bootstrap command into the connected agent:',
+        '6. If the workspace is empty, start small: ask the connected agent to save one fact, preference or procedure you keep repeating (the dashboard Connect page prepares that message). For a full project map instead, or later, paste this optional bootstrap command:',
         ...BRAIN_BOOTSTRAP_PROMPT.split('\n').map((line) => `   ${line}`),
-        '7. Follow the proposal status the agent reports. If it awaits Review, approve, edit, or reject it in the dashboard. The workspace is not populated until the proposal is applied.',
+        '7. Follow the proposal status the agent reports. If it awaits Review, approve, edit, or reject it in the dashboard. Nothing is saved until the proposal is applied.',
         '8. Keep the installed guidance enabled so agents orient before non-trivial work and propose only new durable project knowledge afterward.',
         '9. Check local configuration and public service discovery if needed:',
         ...doctorCommands,

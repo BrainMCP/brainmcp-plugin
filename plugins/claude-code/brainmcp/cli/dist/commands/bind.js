@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CLI_EXIT_CODES, CliConfigurationError, isWorkspaceUuid } from '../lib/cli-contracts.js';
+import { CLI_EXIT_CODES, CliConfigurationError, isWorkspaceUuid, normalizeWorkspaceId } from '../lib/cli-contracts.js';
 import { applyChanges, renderDiff } from '../lib/files.js';
 import { bindingWalkStart, gitEntryEndsBindingWalk, readProjectWorkspaceId } from '../runtime/orient.js';
 import { readPreferences } from '../runtime/storage.js';
@@ -177,10 +177,11 @@ export async function bindProject(options) {
         nextValue = Object.keys(rest).length > 0 ? rest : undefined;
     }
     else {
-        const workspace = options.workspace.trim();
+        const workspace = normalizeWorkspaceId(options.workspace);
         if (!isWorkspaceUuid(workspace))
             throw new Error(WORKSPACE_UUID_REQUIRED);
-        if (existing?.value.workspaceId === workspace) {
+        const existingWorkspace = existing?.value.workspaceId;
+        if (typeof existingWorkspace === 'string' && normalizeWorkspaceId(existingWorkspace) === workspace) {
             report({ changed: false, bound: true, workspaceId: workspace, file: target.filePath }, [`This project is already bound to workspace ${workspace} (${target.filePath}).`, describeCaptureForBinding(workspace, options.baseDir) ?? '']);
             return CLI_EXIT_CODES.SUCCESS;
         }
@@ -198,7 +199,8 @@ export async function bindProject(options) {
     const confirmed = options.yes || await options.confirm(`${options.unbind ? 'Remove the binding from' : 'Write'} ${target.filePath}?`);
     if (!confirmed) {
         report({ changed: false, cancelled: true, file: target.filePath }, ['Cancelled; nothing was written.']);
-        return CLI_EXIT_CODES.SUCCESS;
+        // A declined preview is a general error, as for `init` (README exit codes).
+        return CLI_EXIT_CODES.GENERAL_ERROR;
     }
     await applyChanges([change]);
     const boundWorkspace = options.unbind ? undefined : String(nextValue.workspaceId);

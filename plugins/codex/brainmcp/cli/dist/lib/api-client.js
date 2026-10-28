@@ -290,7 +290,11 @@ export class ApiClient {
             return await this.store.withRefreshLock(async (current) => {
                 if (!current || current.authType !== 'oauth' || current.authorizationId !== original.authorizationId || current.userId !== original.userId)
                     return null;
-                if (current.refreshLease?.leaseHolder !== leaseHolder) {
+                // Discovery plus the exchange can outlast the lease, and another process
+                // may have taken it over. While the stored refresh token is still the one
+                // this refresh spent, the server rotated it here and this response holds
+                // the only valid one, so it is persisted rather than dropped.
+                if (current.refreshLease?.leaseHolder !== leaseHolder && current.refreshToken !== refreshToken) {
                     return current.accessToken !== failedAccessToken ? current : null;
                 }
                 if (current.refreshToken && current.refreshToken !== refreshToken) {
@@ -312,6 +316,9 @@ export class ApiClient {
                         : current.expiresAt,
                     tokenEndpoint,
                     refreshLease: undefined,
+                    // A process that took the lease over and was refused the spent token
+                    // may have marked the grant dead; these tokens are its rotation.
+                    reauthRequired: undefined,
                     updatedAt: now.toISOString(),
                 };
                 await this.store.set(updated);

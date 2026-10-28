@@ -21,4 +21,9 @@ Ask the user to run these in their own terminal. Each opens a browser consent pa
 - Capture status, opt out, or delete queued local data: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" capture status`, `capture disable`, `capture purge-local` (purge deletes captures still waiting for delivery too; `capture now` retries ones that ran out of retries)
 - Sign out: `node "${CLAUDE_PLUGIN_ROOT}/cli/dist/index.js" logout`
 
+## When Brain refuses access
+
+- `brain_workspaces_list` is empty while signed in (`workspace_consent_missing`), or a needed workspace is missing: this connection was not approved for it. Ask the user to add it under that workspace's **Settings → Agent connections** in the dashboard, or to reconnect and choose it on the consent page. Never create a workspace to replace it.
+- `parent_context_consent_required`: a person must approve parent read access for this connection under the workspace's **Settings → Agent connections → Parent read access**. Keep working with the workspace's own knowledge meanwhile.
+
 Hooks need Node.js 22 or newer on PATH. Uninstalling the plugin leaves `~/.brainmcp` (sign-in, preferences, queue); sign out and purge first if the user wants it gone.

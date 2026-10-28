@@ -215,6 +215,14 @@ export function isWorkspaceUuid(value) {
     return WORKSPACE_UUID_RE.test(value);
 }
 /**
+ * Workspace UUIDs match case-insensitively, and the API's canonical form is
+ * lower case: ids from flags, bindings and the server are normalized on the
+ * way in so every later comparison is plain equality.
+ */
+export function normalizeWorkspaceId(value) {
+    return value.trim().toLowerCase();
+}
+/**
  * Redacts credentials with the patterns the API applies before storing a
  * digest (`scrubDigestSecrets`), so ledger prompts and summaries, queued
  * payloads, and `capture now --dry-run` output keep nothing the server would

@@ -42,10 +42,29 @@ export function hasCurrentManagedBlock(text) {
     return start >= 0 && lines.indexOf(MARKER_END, start + 1) > start;
 }
 /**
+ * The CLAUDE.md files Claude Code loads for a session started in `root`: its
+ * own and every ancestor's up to the Git root, where `init --scope project`
+ * writes. A session opened in a subdirectory used to miss the root's block and
+ * receive the guidance a second time. Outside a Git repository, only the
+ * root's own file counts.
+ */
+function projectInstructionCandidates(root, name) {
+    const start = path.resolve(root);
+    const directories = [];
+    for (let directory = start;; directory = path.dirname(directory)) {
+        directories.push(directory);
+        if (fs.existsSync(path.join(directory, '.git')))
+            return directories.map((entry) => path.join(entry, name));
+        if (path.dirname(directory) === directory)
+            return [path.join(start, name)];
+    }
+}
+/**
  * The always-on instruction files where `init` writes its managed block and
  * the host loads it every session.
- * - Claude Code: the user CLAUDE.md in its config directory, and CLAUDE.md at
- *   each project root (`init --scope project`).
+ * - Claude Code: the user CLAUDE.md in its config directory, and for each
+ *   project root the CLAUDE.md files from it up to its Git root
+ *   (`init --scope project`); any one of them counts for that root.
  * - Codex: CODEX_HOME's AGENTS.override.md when it has text, else AGENTS.md,
  *   the order Codex reads them in. A project AGENTS.md does not count: Codex
  *   skips it in a project the user has not trusted and caps project
@@ -55,7 +74,7 @@ function managedInstructionFiles(host, roots, lookup) {
     if (host === 'claude-code') {
         return {
             user: path.join(claudeConfigDir(lookup), 'CLAUDE.md'),
-            projects: roots.map((root) => path.join(root, 'CLAUDE.md')),
+            projects: roots.map((root) => projectInstructionCandidates(root, 'CLAUDE.md')),
         };
     }
     if (host === 'codex') {
@@ -73,7 +92,8 @@ export function hostLoadsCurrentManagedGuidance(host, roots, lookup) {
     const files = managedInstructionFiles(host, roots, lookup);
     if (files.user && hasCurrentManagedBlock(readInstructionFile(files.user)))
         return true;
-    return files.projects.length > 0 && files.projects.every((file) => hasCurrentManagedBlock(readInstructionFile(file)));
+    return files.projects.length > 0 &&
+        files.projects.every((candidates) => candidates.some((file) => hasCurrentManagedBlock(readInstructionFile(file))));
 }
 function utf8Bytes(text) {
     return Buffer.byteLength(text, 'utf8');

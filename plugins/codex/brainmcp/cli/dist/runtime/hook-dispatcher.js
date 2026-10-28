@@ -90,12 +90,11 @@ const READ_ONLY_TOOL_NAMES = new Set([
     'brain_comment_list',
     'brain_workflow_due',
     'brain_skill_resolve',
-    'brain_paste',
     'brain_digest_pending',
 ]);
 const READ_VERBS = new Set([
     'read', 'list', 'get', 'search', 'find', 'fetch', 'query', 'view', 'grep', 'glob', 'ls', 'overview',
-    'show', 'describe', 'resolve', 'due', 'pending', 'lookup', 'inspect', 'browse', 'preview', 'retrieve', 'count',
+    'show', 'describe', 'resolve', 'due', 'lookup', 'inspect', 'browse', 'preview', 'retrieve', 'count',
 ]);
 const WRITE_VERBS = new Set([
     'create', 'update', 'delete', 'remove', 'write', 'edit', 'add', 'set', 'post', 'send', 'mark', 'apply', 'run',

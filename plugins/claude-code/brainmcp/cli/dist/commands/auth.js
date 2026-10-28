@@ -6,7 +6,7 @@ import { BRAINMCP_CLI_CLIENT_ID, BRAINMCP_CLI_DEFAULT_SCOPES, } from '../agent-c
 import { ApiClient } from '../lib/api-client.js';
 import { COMPANION_WORKSPACES_PATH } from '../lib/endpoints.js';
 import { startCallbackServer } from '../lib/callback-server.js';
-import { isWorkspaceUuid, } from '../lib/cli-contracts.js';
+import { isWorkspaceUuid, normalizeWorkspaceId, } from '../lib/cli-contracts.js';
 import { createDefaultCredentialStore, MemoryCredentialStore } from '../lib/credentials.js';
 import { grantedCliScopes, OAuthClient } from '../lib/oauth-client.js';
 export { grantedCliScopes } from '../lib/oauth-client.js';
@@ -28,12 +28,13 @@ export function resolveCompanionWorkspaceGrant(listed) {
     const rows = Array.isArray(listed.workspaces) ? listed.workspaces : [];
     const ids = [...new Set(rows
             .map((workspace) => workspace?.id)
-            .filter((id) => typeof id === 'string' && isWorkspaceUuid(id)))];
+            .filter((id) => typeof id === 'string' && isWorkspaceUuid(id))
+            .map(normalizeWorkspaceId))];
     if (ids.length === 0) {
         throw new Error('The OAuth server did not return an explicit companion workspace allowlist.');
     }
     const accountDefault = typeof listed.account?.defaultWorkspaceId === 'string'
-        ? listed.account.defaultWorkspaceId.trim()
+        ? normalizeWorkspaceId(listed.account.defaultWorkspaceId)
         : '';
     if (accountDefault) {
         if (!ids.includes(accountDefault)) {
@@ -43,8 +44,8 @@ export function resolveCompanionWorkspaceGrant(listed) {
     }
     // Compatibility with responses that marked the default on the workspace row.
     const marked = [...new Set(rows
-            .filter((workspace) => workspace?.isDefault === true && typeof workspace.id === 'string' && ids.includes(workspace.id))
-            .map((workspace) => workspace.id))];
+            .filter((workspace) => workspace?.isDefault === true && typeof workspace.id === 'string' && ids.includes(normalizeWorkspaceId(workspace.id)))
+            .map((workspace) => normalizeWorkspaceId(workspace.id)))];
     if (marked.length === 1)
         return { workspaces: ids, defaultWorkspaceId: marked[0] };
     if (ids.length === 1)
@@ -104,7 +105,11 @@ export function resetCompanionLocalState(home) {
     clearOrientCache(home);
     disableCapture({ baseDir: home });
 }
-/** Commit local identity only after the remote exchange has finished. */
+/**
+ * Commit local identity only after the remote exchange has finished. Resolves
+ * to the record this sign-in overwrote in the account's store (null when the
+ * account had none), so a re-login can revoke the grant it replaced.
+ */
 export async function commitCompanionCredentials(input) {
     const commit = async () => {
         const previous = await input.store.get();
@@ -119,7 +124,10 @@ export async function commitCompanionCredentials(input) {
             migrateLegacyFlatState(input.home, previous.userId);
         const stateDir = input.home ? switchCurrentAccount(input.home, accountId) : null;
         try {
-            await input.store.withRefreshLock(async () => { await input.store.set(input.credentials); });
+            const replaced = await input.store.withRefreshLock(async (latest) => {
+                await input.store.set(input.credentials);
+                return latest;
+            });
             if (input.home)
                 switchCurrentAccount(input.home, accountId);
             if (stateDir) {
@@ -127,6 +135,7 @@ export async function commitCompanionCredentials(input) {
                 if (input.captureWorkspaceId)
                     enableCapture({ baseDir: stateDir, workspaceId: input.captureWorkspaceId });
             }
+            return replaced;
         }
         catch (error) {
             if (input.home && getCurrentAccountId(input.home) === sanitizeAccountId(accountId)) {
@@ -138,10 +147,36 @@ export async function commitCompanionCredentials(input) {
             throw error;
         }
     };
-    if (input.home)
-        await withSessionLock('account-switch', commit, { baseDir: path.join(input.home, 'shared') });
-    else
-        await commit();
+    return input.home ? await withSessionLock('account-switch', commit, { baseDir: path.join(input.home, 'shared') }) : await commit();
+}
+/**
+ * A re-login of the same account leaves the grant it replaced live on the
+ * server until it expires, so it is revoked once the new sign-in is committed.
+ * Best effort: a failure changes nothing locally. A grant marked for re-login,
+ * one with a refresh in flight, or the new authorization itself is left alone:
+ * Better Auth treats revoking a token a refresh already rotated as reuse and
+ * deletes every CLI token the user holds, the new sign-in included. (The API's
+ * refresh-family guard answers a token revoked from the dashboard as a no-op.)
+ * Another account's grant stays in its own namespace and is never revoked here.
+ */
+export async function revokeReplacedCompanionGrant(input) {
+    const { replaced, credentials } = input;
+    const token = replaced?.authType === 'oauth' ? replaced.refreshToken || replaced.accessToken : undefined;
+    const leaseExpiry = Date.parse(replaced?.refreshLease?.expiresAt ?? '');
+    if (!token ||
+        replaced.reauthRequired ||
+        (Number.isFinite(leaseExpiry) && leaseExpiry > Date.now()) ||
+        !replaced.userId ||
+        replaced.userId !== credentials.userId ||
+        replaced.authorizationId === credentials.authorizationId) {
+        return 'skipped';
+    }
+    try {
+        return await input.oauthClient.revokeToken({ revocationEndpoint: input.revocationEndpoint, token }) ? 'revoked' : 'failed';
+    }
+    catch {
+        return 'failed';
+    }
 }
 /**
  * Hooks installed by `brainmcp init` run the runtime it installed until init
@@ -322,9 +357,11 @@ export async function login(options = {}) {
         if (listed.account.scopes) {
             credentialsRecord.scopes = grantedCliScopes(scopes, listed.account.scopes.join(' '));
         }
-        await commitCompanionCredentials({ home, store, credentials: credentialsRecord, force,
+        const replaced = await commitCompanionCredentials({ home, store, credentials: credentialsRecord, force,
             captureWorkspaceId: options.captureDigests && credentialsRecord.scopes?.includes('digests:write')
                 ? credentialsRecord.defaultWorkspaceId ?? undefined : undefined });
+        const replacedGrant = await revokeReplacedCompanionGrant({ oauthClient, revocationEndpoint: endpoints.revocationEndpoint,
+            replaced, credentials: credentialsRecord });
         const responseEnvelope = {
             status: 'authenticated',
             authType: 'oauth',
@@ -340,9 +377,12 @@ export async function login(options = {}) {
         else {
             output(`✓ Successfully authenticated with BrainMCP!`);
             output(`  Client: ${oauthClient.clientId}`);
-            output(`  Scopes: ${grantedScopes.join(', ')}`);
+            output(`  Scopes: ${responseEnvelope.scopes.join(', ')}`);
             output('  This companion grant is for CLI hooks and orientation only.');
             output('  Host agents still need their own MCP OAuth (for Cursor: Settings → Tools & MCP → brain).');
+        }
+        if (replacedGrant === 'failed') {
+            humanOutput('Note: the server did not confirm revoking the sign-in this one replaced; it expires on its own, or revoke it from the dashboard.');
         }
         warnOnHookRuntimeDrift(home, humanOutput);
     }
