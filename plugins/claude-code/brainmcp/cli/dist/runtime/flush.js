@@ -340,10 +340,12 @@ export async function flushCaptureQueue(options) {
             }
             catch (error) {
                 result.bookkeepingErrors = (result.bookkeepingErrors ?? 0) + 1;
+                // The errno or error class only: filesystem messages name local paths.
+                const errno = error?.code;
                 logRuntimeEvent('warn', 'capture_flush_bookkeeping_failed', {
                     digestId: item.digestId,
                     status: updates.status,
-                    error: error instanceof Error ? error.message : String(error),
+                    error: typeof errno === 'string' ? errno : error instanceof Error ? error.name : 'unknown',
                 }, options.baseDir);
             }
         };

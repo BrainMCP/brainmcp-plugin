@@ -3,11 +3,11 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CAPTURE_POLICY_VERSION, scrubDigestSecrets } from '../agent-config.js';
-import { MAX_QUEUE_PROJECT_ROOT_CHARS, MAX_QUEUE_PROJECT_ROOTS, PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, } from '../lib/cli-contracts.js';
+import { MAX_QUEUE_PROJECT_ROOT_CHARS, MAX_QUEUE_PROJECT_ROOTS, PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, truncateCodePoints, MAX_ASSISTANT_SUMMARY_CHARS, } from '../lib/cli-contracts.js';
 import { readPreferences, writePreferences } from './storage.js';
 import { listQueueItems, updateQueueItem } from './queue.js';
 import { logRuntimeEvent } from './diagnostics.js';
-import { readProjectWorkspaceId } from './orient.js';
+import { bindingWalkStart, isTrustedProjectPolicyFile, readProjectWorkspaceId } from './orient.js';
 /**
  * Server digest caps, copied from `MCP_SESSION_DIGEST_MAX_CHARS` and
  * `MCP_SESSION_DIGEST_MAX_BYTES` (packages/types/src/mcp-subscription-limits.ts);
@@ -88,10 +88,14 @@ export function readProjectCaptureRestrictions(startDir) {
     const result = { captureDisabled: false, promptsDisabled: false };
     if (!startDir)
         return result;
-    let dir = path.resolve(startDir);
+    // The same real-path start as the workspace binding walk, so a symlinked
+    // root cannot pick up the binding while skipping the opt-out beside it.
+    let dir = bindingWalkStart(startDir);
     for (let i = 0; i < 16; i += 1) {
         const candidate = path.join(dir, '.brainmcp.json');
-        if (fs.lstatSync(candidate, { throwIfNoEntry: false })) {
+        const found = fs.lstatSync(candidate, { throwIfNoEntry: false });
+        // Another account's file in a world-writable directory is skipped, as the binding walk does.
+        if (found && isTrustedProjectPolicyFile(dir, found)) {
             try {
                 const stat = fs.lstatSync(candidate);
                 if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024)
@@ -178,6 +182,15 @@ export const GIT_METADATA_BUDGETS = {
 };
 /** With less time left than this, a Git call is skipped and reported as timed out. */
 const MIN_GIT_CALL_MS = 20;
+/** The same guard as the backups' Git check (lib/backups.ts): no fsmonitor, no hooks. */
+const GIT_SAFE_CONFIG = ['-c', 'core.fsmonitor=false', ...(process.platform === 'win32' ? [] : ['-c', 'core.hooksPath=/dev/null'])];
+/** The process environment without the variables that point Git at another repository. */
+function gitEnvironment() {
+    const env = { ...process.env };
+    for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_NAMESPACE'])
+        delete env[key];
+    return env;
+}
 /**
  * Read only bounded Git labels/counts; never persist the repository root or changed paths.
  * When `diff` or `status` fails or times out, `diffStats` is omitted rather than
@@ -192,8 +205,14 @@ export function collectGitMetadata(cwd, options) {
     // moment would fail. `status` refreshes the index under it unless
     // `--no-optional-locks` is given; `git diff` does even then, so the diff
     // counts come from the plumbing `diff-index`, which never writes the index.
-    const run = options.runner ?? ((args, timeoutMs) => execFileSync('git', ['--no-optional-locks', '-C', cwd, ...args], {
+    // Hooks run this in whatever repository the agent is in, so a repository's
+    // `core.fsmonitor` and hooks are turned off (fsmonitor runs on `status` and
+    // `diff-index`), and an inherited GIT_DIR must not answer for it. A filter
+    // driver (`filter.*.clean` with `.gitattributes`) can still run, as in the
+    // backups' Git check: the guard narrows what repository config can start.
+    const run = options.runner ?? ((args, timeoutMs) => execFileSync('git', [...GIT_SAFE_CONFIG, '--no-optional-locks', '-C', cwd, ...args], {
         encoding: 'utf8',
+        env: gitEnvironment(),
         timeout: timeoutMs,
         maxBuffer: 64 * 1024,
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -257,6 +276,8 @@ export function collectGitMetadata(cwd, options) {
     }
     return metadata;
 }
+/** Code points of digest summary a capture sends at most ("at most 4,000 characters per digest"). */
+const MAX_SUMMARY_CHARS = MAX_ASSISTANT_SUMMARY_CHARS;
 function truncateUtf8(value, maxBytes) {
     let output = '';
     let bytes = 0;
@@ -330,7 +351,9 @@ export function buildDigestPayload(input) {
         workspaceId: input.workspaceId,
         host: input.host ? truncateUtf8(scrubSecrets(input.host), 80) : undefined,
         model: input.model ? truncateUtf8(scrubSecrets(input.model), 120) : undefined,
-        summary: input.summary ? truncateUtf8(scrubSecrets(input.summary), 4_000) : undefined,
+        // Characters, as the capture disclosure states: a byte cut dropped the
+        // newest turn of a non-ASCII summary. The server caps are enforced below.
+        summary: input.summary ? truncateCodePoints(scrubSecrets(input.summary), MAX_SUMMARY_CHARS) : undefined,
         relativePaths: safePaths.slice(-50),
         gitMetadata: input.gitMetadata
             ? {

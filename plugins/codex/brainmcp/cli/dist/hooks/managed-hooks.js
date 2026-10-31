@@ -8,11 +8,25 @@ import { escapeShellArg } from '../agent-config.js';
  */
 export const HOOK_MANAGED_TAG = 'brainmcp:managed:hook:v1';
 const MANAGED_RUNTIME_BASENAME = 'brainmcp-hook-runtime.mjs';
+/**
+ * What a hook command in a project file runs instead of a path. Teams commit
+ * those files, so a path would be this user's home on everyone's machine. This
+ * finds the shim at run time by `getBrainHome`'s rule, so every copy is
+ * byte-identical (Codex hook trust stays valid, and a teammate's `init` changes
+ * nothing) and answers `{}` for a teammate who has not run `init`, where a path
+ * would report a hook error on every event. The script avoids `"`, `$`, the
+ * backtick, `\`, `%` and `!`, so sh, cmd and PowerShell pass it through as is.
+ * `node -e` leaves no script path in argv, so `brainmcp-hook` takes that slot
+ * and the shim's `process.argv.slice(2)` still starts at the host.
+ */
+export const PROJECT_HOOK_RUNTIME = `-e "const{homedir}=require('node:os'),{resolve}=require('node:path'),{pathToFileURL}=require('node:url');import(pathToFileURL(resolve((process.env.BRAINMCP_HOME??process.env.BRAIN_HOME)||homedir()+'/.brainmcp','runtime/${MANAGED_RUNTIME_BASENAME}')).href).catch(()=>console.log('{}'))" brainmcp-hook`;
 /** Build a host-valid command whose managed marker does not rely on an unknown JSON key. */
 export function buildHookCommand(runtimePath, host, event, options) {
     const mode = options?.nudgeLedger ? ' --nudge-ledger' : '';
     if (!/^[a-z-]+$/.test(host) || !/^[A-Za-z]+$/.test(event))
         throw new Error('Invalid managed hook host or event.');
+    if (runtimePath === PROJECT_HOOK_RUNTIME)
+        return `node ${runtimePath} ${host} ${event}${mode} --managed-tag=${HOOK_MANAGED_TAG}`;
     if (process.platform === 'win32' && /[%!"\r\n]/.test(runtimePath))
         throw new Error('The Windows hook runtime path contains shell expansion characters. Choose a BRAINMCP_HOME without them.');
     const quotedPath = process.platform === 'win32' ? `"${runtimePath}"` : escapeShellArg(runtimePath);

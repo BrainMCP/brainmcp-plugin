@@ -126,7 +126,10 @@ export async function applyChanges(changes, options = {}) {
         }
         const temporary = `${writePath}.brainmcp-tmp-${randomUUID()}`;
         try {
-            await writeFile(temporary, change.after, 'utf8');
+            // Created with the original's mode (never wider, even before the chmod)
+            // so a 0600 config holding tokens is never briefly world-readable; the
+            // chmod restores mode bits the umask masked. A new file keeps the umask default.
+            await writeFile(temporary, change.after, { encoding: 'utf8', mode: existingMode ?? 0o666, flag: 'wx' });
             if (existingMode !== undefined)
                 await chmod(temporary, existingMode);
             await rename(temporary, writePath);

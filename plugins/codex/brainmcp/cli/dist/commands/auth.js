@@ -123,11 +123,13 @@ export async function commitCompanionCredentials(input) {
         if (input.home && !previousAccount && previous?.userId)
             migrateLegacyFlatState(input.home, previous.userId);
         const stateDir = input.home ? switchCurrentAccount(input.home, accountId) : null;
+        let written;
         try {
             const replaced = await input.store.withRefreshLock(async (latest) => {
                 await input.store.set(input.credentials);
                 return latest;
             });
+            written = { replaced };
             if (input.home)
                 switchCurrentAccount(input.home, accountId);
             if (stateDir) {
@@ -138,6 +140,19 @@ export async function commitCompanionCredentials(input) {
             return replaced;
         }
         catch (error) {
+            // A failed sign-in leaves the account's store as it found it, so nothing
+            // holds the new grant and the caller revokes it (revokeIssuedGrantOnFailure).
+            if (written) {
+                try {
+                    if (written.replaced)
+                        await input.store.set(written.replaced);
+                    else
+                        await input.store.clear();
+                }
+                catch {
+                    // Report the failure that stopped the sign-in.
+                }
+            }
             if (input.home && getCurrentAccountId(input.home) === sanitizeAccountId(accountId)) {
                 if (previousAccount)
                     switchCurrentAccount(input.home, previousAccount);
@@ -176,6 +191,29 @@ export async function revokeReplacedCompanionGrant(input) {
     }
     catch {
         return 'failed';
+    }
+}
+/**
+ * Runs the post-exchange part of a login; when it throws, revokes the grant the
+ * exchange just issued (best effort, the original error wins) unless the store
+ * already holds it — a commit that failed after storing the new sign-in keeps it.
+ */
+export async function revokeIssuedGrantOnFailure(input, run) {
+    try {
+        return await run();
+    }
+    catch (error) {
+        const { access_token: accessToken, refresh_token: refreshToken } = input.tokenResponse;
+        try {
+            const stored = await input.store.get();
+            if (stored?.accessToken !== accessToken) {
+                await input.oauthClient.revokeToken({ revocationEndpoint: input.revocationEndpoint, token: refreshToken || accessToken });
+            }
+        }
+        catch {
+            // The grant expires on its own; report the failure that stopped the login.
+        }
+        throw error;
     }
 }
 /**
@@ -317,49 +355,57 @@ export async function login(options = {}) {
             redirectUri: callbackServer.redirectUri,
             codeVerifier: pkce.verifier,
         });
-        const now = new Date();
-        const expiresAt = tokenResponse.expires_in
-            ? new Date(now.getTime() + tokenResponse.expires_in * 1000).toISOString()
-            : undefined;
-        const grantedScopes = grantedCliScopes(scopes, typeof tokenResponse.scope === 'string' ? tokenResponse.scope : undefined);
-        const credentialsRecord = {
-            version: 1,
-            authType: 'oauth',
-            accessToken: tokenResponse.access_token,
-            refreshToken: tokenResponse.refresh_token,
-            expiresAt,
-            clientId: oauthClient.clientId,
-            scopes: grantedScopes,
-            tokenEndpoint: endpoints.tokenEndpoint,
-            updatedAt: now.toISOString(),
-        };
-        const home = companionRuntimeHome(options);
-        const apiClient = options.apiClient ?? new ApiClient({ store, oauthClient });
-        const listed = await apiClient.request(COMPANION_WORKSPACES_PATH, {
-            timeoutMs: 3_000,
-            headers: { Authorization: `Bearer ${tokenResponse.access_token}` },
+        // A failure after the exchange (listing, identity checks, the workspace
+        // grant, the commit) would otherwise leave the new grant live on the server
+        // with nothing holding it.
+        const { credentialsRecord, grantedScopes, home, replaced } = await revokeIssuedGrantOnFailure({
+            oauthClient, revocationEndpoint: endpoints.revocationEndpoint, store, tokenResponse,
+        }, async () => {
+            const now = new Date();
+            const expiresAt = tokenResponse.expires_in
+                ? new Date(now.getTime() + tokenResponse.expires_in * 1000).toISOString()
+                : undefined;
+            const grantedScopes = grantedCliScopes(scopes, typeof tokenResponse.scope === 'string' ? tokenResponse.scope : undefined);
+            const credentialsRecord = {
+                version: 1,
+                authType: 'oauth',
+                accessToken: tokenResponse.access_token,
+                refreshToken: tokenResponse.refresh_token,
+                expiresAt,
+                clientId: oauthClient.clientId,
+                scopes: grantedScopes,
+                tokenEndpoint: endpoints.tokenEndpoint,
+                updatedAt: now.toISOString(),
+            };
+            const home = companionRuntimeHome(options);
+            const apiClient = options.apiClient ?? new ApiClient({ store, oauthClient });
+            const listed = await apiClient.request(COMPANION_WORKSPACES_PATH, {
+                timeoutMs: 3_000,
+                headers: { Authorization: `Bearer ${tokenResponse.access_token}` },
+            });
+            if (listed.account?.clientId !== BRAINMCP_CLI_CLIENT_ID) {
+                throw new Error('The issued OAuth token is not bound to the BrainMCP CLI client.');
+            }
+            if (!listed.account?.authorizationId) {
+                throw new Error('The OAuth server did not return the companion authorization identity.');
+            }
+            if (!listed.account?.userId?.trim()) {
+                throw new Error('The OAuth server did not return the companion account identity.');
+            }
+            const grant = resolveCompanionWorkspaceGrant(listed);
+            credentialsRecord.workspaces = grant.workspaces;
+            credentialsRecord.defaultWorkspaceId = grant.defaultWorkspaceId;
+            credentialsRecord.userId = listed.account.userId.trim();
+            credentialsRecord.authorizationId = listed.account.authorizationId;
+            credentialsRecord.provenance = listed.account.provenance;
+            if (listed.account.scopes) {
+                credentialsRecord.scopes = grantedCliScopes(scopes, listed.account.scopes.join(' '));
+            }
+            const replaced = await commitCompanionCredentials({ home, store, credentials: credentialsRecord, force,
+                captureWorkspaceId: options.captureDigests && credentialsRecord.scopes?.includes('digests:write')
+                    ? credentialsRecord.defaultWorkspaceId ?? undefined : undefined });
+            return { credentialsRecord, grantedScopes, home, replaced };
         });
-        if (listed.account?.clientId !== BRAINMCP_CLI_CLIENT_ID) {
-            throw new Error('The issued OAuth token is not bound to the BrainMCP CLI client.');
-        }
-        if (!listed.account?.authorizationId) {
-            throw new Error('The OAuth server did not return the companion authorization identity.');
-        }
-        if (!listed.account?.userId?.trim()) {
-            throw new Error('The OAuth server did not return the companion account identity.');
-        }
-        const grant = resolveCompanionWorkspaceGrant(listed);
-        credentialsRecord.workspaces = grant.workspaces;
-        credentialsRecord.defaultWorkspaceId = grant.defaultWorkspaceId;
-        credentialsRecord.userId = listed.account.userId.trim();
-        credentialsRecord.authorizationId = listed.account.authorizationId;
-        credentialsRecord.provenance = listed.account.provenance;
-        if (listed.account.scopes) {
-            credentialsRecord.scopes = grantedCliScopes(scopes, listed.account.scopes.join(' '));
-        }
-        const replaced = await commitCompanionCredentials({ home, store, credentials: credentialsRecord, force,
-            captureWorkspaceId: options.captureDigests && credentialsRecord.scopes?.includes('digests:write')
-                ? credentialsRecord.defaultWorkspaceId ?? undefined : undefined });
         const replacedGrant = await revokeReplacedCompanionGrant({ oauthClient, revocationEndpoint: endpoints.revocationEndpoint,
             replaced, credentials: credentialsRecord });
         const responseEnvelope = {

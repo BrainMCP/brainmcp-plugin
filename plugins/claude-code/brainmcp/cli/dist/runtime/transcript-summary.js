@@ -34,8 +34,8 @@ export const TRANSCRIPT_SUMMARY_MAX_TURNS = 3;
 /** Characters kept of one closing message (code points). */
 export const TRANSCRIPT_SUMMARY_TURN_MAX_CHARS = 1_500;
 /**
- * Characters of the whole summary. The digest keeps at most 4,000 UTF-8 bytes
- * of a summary (`buildDigestPayload`), so mostly-ASCII text fits whole.
+ * Characters of the whole summary. The digest keeps at most 4,000 characters
+ * of a summary (`buildDigestPayload`), so this fits whole in any script.
  */
 export const TRANSCRIPT_SUMMARY_MAX_CHARS = 3_800;
 function asRecord(value) {

@@ -29,7 +29,7 @@ export function getVersionedRuntimePath(version, baseDir) {
     return path.join(versionDir, 'brainmcp-hook-runtime.mjs');
 }
 /**
- * The version-independent runtime path every managed hook command names:
+ * The version-independent runtime path every managed hook command runs:
  * `~/.brainmcp/runtime/brainmcp-hook-runtime.mjs`, a small shim that runs the
  * versioned runtime `init` installed last. A CLI upgrade then rewrites the shim
  * and leaves host hook configs byte-identical, which keeps Codex hook trust

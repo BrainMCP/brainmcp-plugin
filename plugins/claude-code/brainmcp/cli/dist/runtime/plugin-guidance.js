@@ -3,6 +3,7 @@ import path from 'node:path';
 import { buildCompactInstructionBlock } from '../agent-config.js';
 import { MARKER_END, MARKER_START } from '../lib/config.js';
 import { claudeConfigDir, codexHomeDir } from '../lib/host-plugins.js';
+import { bindingWalkStart, gitEntryEndsBindingWalk } from './orient.js';
 /**
  * Most UTF-8 bytes a plugin SessionStart puts in its one `additionalContext`
  * string. Past its cap a host saves the text to a file and shows the agent only
@@ -45,15 +46,17 @@ export function hasCurrentManagedBlock(text) {
  * The CLAUDE.md files Claude Code loads for a session started in `root`: its
  * own and every ancestor's up to the Git root, where `init --scope project`
  * writes. A session opened in a subdirectory used to miss the root's block and
- * receive the guidance a second time. Outside a Git repository, only the
- * root's own file counts.
+ * receive the guidance a second time. A linked worktree nested in its main
+ * checkout (`<repo>/.claude/worktrees/x`) walks on to the main checkout's root,
+ * as the binding walk does (gitEntryEndsBindingWalk). Outside a Git
+ * repository, only the root's own file counts.
  */
 function projectInstructionCandidates(root, name) {
-    const start = path.resolve(root);
+    const start = bindingWalkStart(root);
     const directories = [];
     for (let directory = start;; directory = path.dirname(directory)) {
         directories.push(directory);
-        if (fs.existsSync(path.join(directory, '.git')))
+        if (gitEntryEndsBindingWalk(directory))
             return directories.map((entry) => path.join(entry, name));
         if (path.dirname(directory) === directory)
             return [path.join(start, name)];

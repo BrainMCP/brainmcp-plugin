@@ -369,6 +369,22 @@ export function bindingWalkStart(dir) {
         return resolved;
     }
 }
+/**
+ * Whether the `.brainmcp.json` in `dir` (lstat `stat`) may govern this user's
+ * sessions. In a directory any account can write to (world-writable, such as
+ * /tmp, which a walk outside Git and $HOME reaches), only a file of this user
+ * or root counts: another account could otherwise plant a binding or opt-out
+ * there that stops orientation and capture for every directory below it.
+ * Such a file is skipped as if absent.
+ */
+export function isTrustedProjectPolicyFile(dir, stat) {
+    if (process.platform === 'win32' || typeof process.getuid !== 'function')
+        return true;
+    if (stat.uid === process.getuid() || stat.uid === 0)
+        return true;
+    const directory = fs.statSync(dir, { throwIfNoEntry: false });
+    return !directory || (directory.mode & 0o002) === 0;
+}
 export function readProjectWorkspaceId(startDir, homeDir = os.homedir()) {
     if (!startDir)
         return { kind: 'none' };
@@ -376,7 +392,7 @@ export function readProjectWorkspaceId(startDir, homeDir = os.homedir()) {
     const home = bindingWalkStart(homeDir);
     for (let depth = 0; depth < 16; depth += 1) {
         const configPath = path.join(dir, '.brainmcp.json');
-        if (fs.existsSync(configPath)) {
+        if (fs.existsSync(configPath) && isTrustedProjectPolicyFile(dir, fs.lstatSync(configPath))) {
             try {
                 const stat = fs.lstatSync(configPath);
                 if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) {

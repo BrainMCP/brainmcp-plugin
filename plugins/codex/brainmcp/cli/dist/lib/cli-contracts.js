@@ -4,6 +4,13 @@
  */
 import path from 'node:path';
 import { CAPTURE_POLICY_VERSION, scrubDigestSecrets, } from '../agent-config.js';
+/** Code points of assistant summary a ledger keeps and a capture sends ("at most 4,000 characters"). */
+export const MAX_ASSISTANT_SUMMARY_CHARS = 4_000;
+/** The first `maxCodePoints` code points: never splits a surrogate pair, as a UTF-16 `slice` can. */
+export function truncateCodePoints(value, maxCodePoints) {
+    const points = Array.from(value);
+    return points.length <= maxCodePoints ? value : points.slice(0, maxCodePoints).join('');
+}
 // =====================================================================
 // CLI Exit Codes (AHI-012)
 // =====================================================================
@@ -115,7 +122,7 @@ export function validateSessionLedgerRecord(data) {
         lastNudgedSequence: typeof obj.lastNudgedSequence === 'number' ? obj.lastNudgedSequence : undefined,
         editedPaths: Array.isArray(obj.editedPaths) ? obj.editedPaths.filter((p) => typeof p === 'string').slice(0, 100) : [],
         prompts: Array.isArray(obj.prompts) ? obj.prompts.filter((p) => typeof p === 'string').slice(0, 50) : undefined,
-        assistantSummary: typeof obj.assistantSummary === 'string' ? obj.assistantSummary.slice(0, 4000) : undefined,
+        assistantSummary: typeof obj.assistantSummary === 'string' ? truncateCodePoints(obj.assistantSummary, MAX_ASSISTANT_SUMMARY_CHARS) : undefined,
         model: typeof obj.model === 'string' ? obj.model.slice(0, 120) : undefined,
         deliveryIds: Array.isArray(obj.deliveryIds) ? obj.deliveryIds.filter((d) => typeof d === 'string').slice(-100) : [],
         captureRevision: typeof obj.captureRevision === 'number' ? obj.captureRevision : undefined,

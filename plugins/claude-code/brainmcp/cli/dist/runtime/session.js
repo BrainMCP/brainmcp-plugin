@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { SESSION_LEDGER_SCHEMA_VERSION, validateSessionLedgerRecord, scrubSecrets, } from '../lib/cli-contracts.js';
+import { SESSION_LEDGER_SCHEMA_VERSION, validateSessionLedgerRecord, scrubSecrets, truncateCodePoints, MAX_ASSISTANT_SUMMARY_CHARS, } from '../lib/cli-contracts.js';
 import { enqueueCaptureItem, listQueueItems } from './queue.js';
 import { canEnqueueCapture } from './flush.js';
-import { ensureDirectory0700, writeAtomic0600, readSafeJson, resolveStateDir } from './storage.js';
+import { ensureDirectory0700, getBrainHome, writeAtomic0600, readSafeJson, resolveStateDir } from './storage.js';
 import { withSessionLock } from './lock.js';
 /**
  * A Brain tool's own name without the host's MCP prefix. Hosts prefix MCP tools
@@ -109,6 +109,54 @@ export function parseBrainToolResult(toolName, toolResult) {
         }
     }
     return { isWriteBack: false };
+}
+/**
+ * Host sessions (one host's session id, without its roots) that have had an event under a root
+ * whose project opts out of capture or is bound to another workspace. A capture's slice and its
+ * policy check cover only its own roots (their ledger key includes them), but the host transcript
+ * a capture summarizes holds every turn of the host session, wherever it ran.
+ */
+export const BLOCKED_HOST_SESSIONS_DIR = 'blocked-host-sessions';
+/**
+ * How long a mark outlives its last refresh. A host can resume a session (same id, same
+ * transcript) long after the session ledgers' 14 days: Claude Code keeps transcripts for 30 days
+ * by default. A mark holds no content and only withholds summaries, so keeping it longer can only
+ * over-suppress.
+ */
+export const BLOCKED_HOST_SESSION_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+/**
+ * Marks live in the Brain home, not an account's state directory: the host session and its
+ * transcript are the same whichever Brain account is signed in when a later capture runs.
+ */
+function blockedHostSessionPath(hostSessionKey, brainHome) {
+    const directory = path.join(path.resolve(brainHome ?? getBrainHome()), BLOCKED_HOST_SESSIONS_DIR);
+    ensureDirectory0700(directory);
+    return path.join(directory, `${hostSessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
+}
+/**
+ * Mark a host session as having worked under a root capture may not cover. Idempotent; a repeat
+ * refreshes the mark's time, which retention ages out after {@link BLOCKED_HOST_SESSION_MAX_AGE_MS}.
+ */
+export function markHostSessionBlockedRoot(hostSessionKey, brainHome) {
+    const filePath = blockedHostSessionPath(hostSessionKey, brainHome);
+    if (readSafeJson(filePath) !== null) {
+        const now = new Date();
+        fs.utimesSync(filePath, now, now);
+        return;
+    }
+    writeAtomic0600(filePath, JSON.stringify({ version: 1 }));
+}
+/**
+ * Whether {@link markHostSessionBlockedRoot} marked this host session (a symlinked or foreign
+ * marker throws). A mark found is refreshed: the session is still running.
+ */
+export function hostSessionHasBlockedRoot(hostSessionKey, brainHome) {
+    const filePath = blockedHostSessionPath(hostSessionKey, brainHome);
+    if (readSafeJson(filePath) === null)
+        return false;
+    const now = new Date();
+    fs.utimesSync(filePath, now, now);
+    return true;
 }
 export function getSessionLedgerPath(sessionKey, baseDir) {
     const sessionsDir = path.join(resolveStateDir(baseDir), 'sessions');
@@ -228,7 +276,7 @@ export async function recordSessionEvent(input) {
             ledger.prompts.push(scrubSecrets(input.prompt).slice(0, 1000));
         }
         if (input.assistantSummary?.trim()) {
-            ledger.assistantSummary = scrubSecrets(input.assistantSummary.trim()).slice(0, 4000);
+            ledger.assistantSummary = truncateCodePoints(scrubSecrets(input.assistantSummary.trim()), MAX_ASSISTANT_SUMMARY_CHARS);
         }
         if (input.model?.trim()) {
             ledger.model = input.model.trim().slice(0, 120);

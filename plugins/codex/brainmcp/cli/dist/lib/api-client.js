@@ -225,8 +225,12 @@ export class ApiClient {
         let cachedTokenEndpoint;
         // Claim a short fenced lease under the credential lock, then release the
         // filesystem lock before doing OAuth network I/O. A concurrent process
-        // either reuses the rotated credential or waits for the lease owner.
-        for (let attempt = 0; attempt < 50; attempt += 1) {
+        // either reuses the rotated credential or waits for the lease owner: until
+        // the owner stores its rotation, or until the lease expires and can be taken
+        // over, bounded by the caller's deadline. Giving up earlier (after about 5 s
+        // of a 15 s lease) sent the expired token, and its 401 failed a queued
+        // capture as signed out although the grant was fine.
+        for (;;) {
             signal.throwIfAborted();
             const claim = await this.store.withRefreshLock(async (current) => {
                 signal.throwIfAborted();
@@ -242,10 +246,12 @@ export class ApiClient {
                 const leaseExpiry = current.refreshLease
                     ? Date.parse(current.refreshLease.expiresAt)
                     : Number.NaN;
+                // A lease that ends later than any holder sets one is corrupt: take it over.
                 if (current.refreshLease &&
                     current.refreshLease.leaseHolder !== leaseHolder &&
                     Number.isFinite(leaseExpiry) &&
-                    leaseExpiry > Date.now()) {
+                    leaseExpiry > Date.now() &&
+                    leaseExpiry <= Date.now() + leaseDurationMs + 5_000) {
                     return { kind: 'wait', current };
                 }
                 const updated = {

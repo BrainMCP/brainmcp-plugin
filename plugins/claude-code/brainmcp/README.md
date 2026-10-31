@@ -1,6 +1,6 @@
 # brainMCP for Claude Code
 
-Version 0.1.42 (guidance 2026.10.28). Shared, reviewable project memory for coding agents: Claude orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
+Version 0.1.43 (guidance 2026.10.28). Shared, reviewable project memory for coding agents: Claude orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
 
 ## Install
 
@@ -25,7 +25,7 @@ If your network blocks Dynamic Client Registration, add the server with the stat
 - `.mcp.json`: the `brain` server, shown as `plugin:brainmcp:brain`.
 - `skills/using-brainmcp` (how to use Brain) and `skills/setup` (sign-in, capture, diagnosis).
 - `hooks/hooks.json`: SessionStart, UserPromptSubmit, PostToolUse, PreCompact, and SessionEnd. Hooks inject context; they cannot force a tool call.
-- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.42, unmodified and unbundled.
+- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.43, unmodified and unbundled.
 
 A plugin cannot write CLAUDE.md, so every session start adds Brain's always-on guidance (guidance 2026.10.28, in compact form), signed in or not. It leaves that out when `~/.claude/CLAUDE.md` (under `CLAUDE_CONFIG_DIR` when that is set) or the CLAUDE.md at the project root already has the block `brainmcp init` writes for the same guidance version.
 

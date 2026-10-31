@@ -6,6 +6,7 @@ import { listQueueItems, removeQueueItem } from './queue.js';
 import { isProcessAlive, removeLockIfStill } from './lock.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { pruneBackups } from '../lib/backups.js';
+import { BLOCKED_HOST_SESSION_MAX_AGE_MS, BLOCKED_HOST_SESSIONS_DIR } from './session.js';
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 const FIVE_MB_BYTES = 5 * 1024 * 1024;
@@ -73,6 +74,7 @@ export function pruneLocalState(options) {
     const now = options?.now ?? Date.now();
     const maxQueueAge = options?.maxQueueAgeMs ?? SEVEN_DAYS_MS;
     const maxSessionAge = options?.maxSessionAgeMs ?? FOURTEEN_DAYS_MS;
+    const maxBlockedHostSessionAge = Math.max(maxSessionAge, BLOCKED_HOST_SESSION_MAX_AGE_MS);
     const maxLogSize = options?.maxLogSizeBytes ?? FIVE_MB_BYTES;
     let prunedQueueCount = 0;
     const prunedUndelivered = { total: 0, manual: 0, active: 0, failed: 0, cancelled: 0 };
@@ -123,6 +125,30 @@ export function pruneLocalState(options) {
                         fs.unlinkSync(filePath);
                         prunedSessionCount += 1;
                     }
+                }
+                catch {
+                    // Ignore
+                }
+            }
+        }
+        catch {
+            // Ignore
+        }
+    }
+    // 2b. Blocked-host-session markers (in the Brain home, across accounts) outlive the ledgers:
+    // a host can resume a session after 14 days with its whole transcript.
+    const blockedDir = path.join(brainHome, BLOCKED_HOST_SESSIONS_DIR);
+    if (fs.existsSync(blockedDir)) {
+        try {
+            assertNotSymlink(blockedDir);
+            for (const file of fs.readdirSync(blockedDir)) {
+                if (!file.endsWith('.json'))
+                    continue;
+                const filePath = path.join(blockedDir, file);
+                try {
+                    const stat = fs.lstatSync(filePath);
+                    if (!stat.isSymbolicLink() && now - stat.mtimeMs > maxBlockedHostSessionAge)
+                        fs.unlinkSync(filePath);
                 }
                 catch {
                     // Ignore

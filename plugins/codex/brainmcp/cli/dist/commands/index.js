@@ -13,7 +13,7 @@ import { getBrainHome } from '../runtime/storage.js';
 import { CliConfigurationError, isWorkspaceUuid } from '../lib/cli-contracts.js';
 import { RequestDeadlineError, withRequestDeadline } from '../lib/http.js';
 import { cliPackageVersion, getRuntimeShimPath, getVersionedRuntimePath, loadPackagedRuntimeBundle, renderRuntimeShim, } from '../runtime/installer.js';
-import { managedHookEvents, managedHookPositions, managedNonNudgeHookEvents, removeClaudeManagedHooks, removeCodexManagedHooks, removeCursorManagedHooks, removeVsCodeManagedHooks, upsertClaudeManagedHooks, upsertClaudeNudgeHooks, upsertCodexManagedHooks, upsertCursorManagedHooks, upsertVsCodeManagedHooks, } from '../hooks/managed-hooks.js';
+import { managedHookEvents, managedHookPositions, managedNonNudgeHookEvents, PROJECT_HOOK_RUNTIME, removeClaudeManagedHooks, removeCodexManagedHooks, removeCursorManagedHooks, removeVsCodeManagedHooks, upsertClaudeManagedHooks, upsertClaudeNudgeHooks, upsertCodexManagedHooks, upsertCursorManagedHooks, upsertVsCodeManagedHooks, } from '../hooks/managed-hooks.js';
 import { claudeConfigDir, codexManagedHookTrust, describePluginInstall, detectHostPlugin, isPluginHost, PLUGIN_HOOK_EVENTS, pluginReplacingInit, pluginRunsAllHooks, pluginRunsHook, } from '../lib/host-plugins.js';
 /**
  * Deadline for each public discovery probe in `doctor`, body read included. A
@@ -770,10 +770,14 @@ async function plannedHookChanges(options, client, target, mode) {
     const brainHome = brainHomeFor(options);
     const version = cliPackageVersion();
     const runtimePath = getVersionedRuntimePath(version, brainHome);
-    // Hook commands name the version-independent shim, so they stay byte-identical
+    // Hook commands run the version-independent shim, so they stay byte-identical
     // across upgrades (Codex re-asks for trust when a hook command changes). The
     // versioned runtime is written first; the shim then points at it.
     const shimPath = getRuntimeShimPath(brainHome);
+    // Project hook files are committed, so they name no path from this home. User
+    // ones stay on the shim's path, which keeps their commands, and Codex's trust
+    // in them, unchanged.
+    const hookRuntime = options.scope === 'project' ? PROJECT_HOOK_RUNTIME : shimPath;
     const changes = [];
     const existingRuntime = await readText(runtimePath);
     if (existingRuntime !== bundle) {
@@ -787,14 +791,14 @@ async function plannedHookChanges(options, client, target, mode) {
     }
     const parsed = existingHook?.trim() ? parseJsonc(existingHook) : {};
     const next = mode === 'nudge'
-        ? upsertClaudeNudgeHooks(parsed, shimPath)
+        ? upsertClaudeNudgeHooks(parsed, hookRuntime)
         : client === 'claude-code'
-            ? upsertClaudeManagedHooks(parsed, shimPath, { enableNudge: Boolean(options.writeBackNudge) })
+            ? upsertClaudeManagedHooks(parsed, hookRuntime, { enableNudge: Boolean(options.writeBackNudge) })
             : client === 'cursor'
-                ? upsertCursorManagedHooks(parsed, shimPath)
+                ? upsertCursorManagedHooks(parsed, hookRuntime)
                 : client === 'codex'
-                    ? upsertCodexManagedHooks(parsed, shimPath)
-                    : upsertVsCodeManagedHooks(parsed, shimPath);
+                    ? upsertCodexManagedHooks(parsed, hookRuntime)
+                    : upsertVsCodeManagedHooks(parsed, hookRuntime);
     const eventNames = client === 'claude-code'
         ? ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PreCompact', 'SessionEnd', 'Stop']
         : client === 'cursor'

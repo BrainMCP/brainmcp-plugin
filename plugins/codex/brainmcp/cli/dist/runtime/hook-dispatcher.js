@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { CAPTURE_POLICY_VERSION } from '../agent-config.js';
 import { filterRelativePaths } from '../lib/cli-contracts.js';
 import { emitHostOutput } from '../hooks/adapters.js';
-import { markSessionNudged, queueSessionCapture, recordSessionEvent } from './session.js';
+import { hostSessionHasBlockedRoot, markHostSessionBlockedRoot, markSessionNudged, queueSessionCapture, recordSessionEvent, } from './session.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { getBrainHome, readPreferences, resolveStateDir } from './storage.js';
 import { pruneLocalState } from './retention.js';
@@ -56,11 +56,35 @@ export function hookDispatchTimeoutMs(event, host) {
 export function hookDispatchMaxTimeoutMs(event, host) {
     return isSessionStartEvent(event) ? SESSION_START_MAX_TIMEOUT_MS : hookDispatchTimeoutMs(event, host);
 }
+/**
+ * Tools that change the one file their input names, as each host reports them.
+ * Claude Code: its edit tools (`file_path`, or `notebook_path` for NotebookEdit).
+ * Cursor: `Write`, which covers every edit tool, and `Delete` (`file_path`).
+ * VS Code: the model-facing tool names (`filePath`), or Claude-style names from
+ * its Claude-compatible hooks. Codex has none: `apply_patch` names its files only
+ * in the patch text, as VS Code's does, and VS Code's
+ * `multi_replace_string_in_file` names several. Anything else never counts,
+ * whatever its input holds: Cursor's `Read`, `List` and `Grep` send `file_path`
+ * too, and an MCP tool's effect is unknown.
+ */
+const FILE_EDIT_TOOL_NAMES = new Set([
+    'Edit',
+    'Write',
+    'MultiEdit',
+    'NotebookEdit',
+    'Delete',
+    'create_file',
+    'replace_string_in_file',
+    'insert_edit_into_file',
+    'edit_notebook_file',
+]);
 function editedPathFromEvent(event) {
+    if (!event.toolName || !FILE_EDIT_TOOL_NAMES.has(event.toolName))
+        return undefined;
     if (!event.cwd || !event.toolInput || typeof event.toolInput !== 'object')
         return undefined;
     const input = event.toolInput;
-    const candidate = [input.file_path, input.filePath, input.path].find((value) => typeof value === 'string' && value.trim().length > 0);
+    const candidate = [input.file_path, input.filePath, input.notebook_path, input.path].find((value) => typeof value === 'string' && value.trim().length > 0);
     return candidate ? filterRelativePaths([candidate], event.cwd)[0] : undefined;
 }
 /**
@@ -230,6 +254,43 @@ export async function readBoundedStdin(stream = process.stdin, maxBytes = MAX_ST
     });
 }
 /**
+ * Mark the host session once one of its events runs under a root its captures may not cover: a
+ * project that opts out of capture (always: an opt-out is a promise, even before capture is turned
+ * on), or, while capture is on, one bound to another workspace than the capture's. Before capture
+ * is configured there is no capture workspace to conflict with, so a bound project is not marked.
+ * Every such event refreshes the mark, so it ages out with the session rather than from its first
+ * write.
+ */
+function noteBlockedRootForHostSession(hostSessionKey, roots, policies, prefs, brainHome) {
+    if (!hostSessionKey)
+        return;
+    const optedOut = policies.some((policy) => policy.captureDisabled);
+    const boundElsewhere = captureConsentActive(prefs) && Boolean(prefs?.enabledWorkspaceId)
+        && projectBindingBlocksCapture(roots, prefs?.enabledWorkspaceId);
+    if (!optedOut && !boundElsewhere)
+        return;
+    try {
+        markHostSessionBlockedRoot(hostSessionKey, brainHome);
+    }
+    catch {
+        // Unwritable state also stops a capture from queueing anything.
+    }
+}
+function hostSessionMayCarryBlockedTurns(hostSessionKey, brainHome) {
+    if (!hostSessionKey)
+        return false;
+    try {
+        return hostSessionHasBlockedRoot(hostSessionKey, brainHome);
+    }
+    catch {
+        return true;
+    }
+}
+function withheldTranscriptSummary(event, baseDir) {
+    logRuntimeEvent('info', 'capture_transcript_summary_unavailable', { event: event.event, client: event.client, reason: 'blocked_root_in_session' }, baseDir);
+    return undefined;
+}
+/**
  * The closing replies of the latest turns in the host's transcript, or
  * undefined. Logs only why it found none (a content-free class).
  */
@@ -318,7 +379,21 @@ export async function dispatchHookEvent(event, options) {
         // wrote then does nothing, so the plugin's copy runs alone. A nudge-ledger
         // hook decides below, once the capture policy is known.
         const yieldsToPlugin = managedHookYieldsToPlugin(event, options?.pluginLookup);
+        // The host session itself, whatever roots its events carry: its transcript spans all of them.
+        const hostSessionKey = event.sessionKey && event.sessionKey !== 'default_session'
+            ? crypto.createHash('sha256').update(JSON.stringify(['host-session', event.client, event.sessionKey])).digest('hex')
+            : undefined;
         if (yieldsToPlugin && !event.nudgeLedger) {
+            // The plugin's hook may not run for this root (its plugin is not loaded where the host
+            // started), so the blocked-root mark cannot wait for it.
+            try {
+                const stateDir = resolveStateDir(options?.baseDir);
+                const yieldRoots = event.workspaceRoots?.length ? event.workspaceRoots : event.cwd ? [event.cwd] : [];
+                noteBlockedRootForHostSession(hostSessionKey, yieldRoots, yieldRoots.map(readProjectCaptureRestrictions), readPreferences(stateDir), credentialOptions?.baseDir);
+            }
+            catch {
+                // Unreadable state stops capture from queueing anything too.
+            }
             return { handled: true, emptyFallback: false, outputPayload: {} };
         }
         // Never persist host IDs or share ledgers across hosts/projects. A missing
@@ -340,6 +415,8 @@ export async function dispatchHookEvent(event, options) {
             captureDisabled: policies.some((policy) => policy.captureDisabled) || projectBindingBlocksCapture(roots, prefs?.enabledWorkspaceId),
             promptsDisabled: policies.some((policy) => policy.promptsDisabled),
         };
+        // Marks live in the Brain home (credentialOptions.baseDir), across accounts.
+        noteBlockedRootForHostSession(hostSessionKey, roots, policies, prefs, credentialOptions?.baseDir);
         // Consent to an earlier capture policy pauses capture (doctor says how to re-consent).
         const captureRuntimeEnabled = Boolean(captureConsentActive(prefs) && !projectPolicy.captureDisabled);
         // Content needs the complete capture policy: a project opt-out stops prompt
@@ -412,8 +489,12 @@ export async function dispatchHookEvent(event, options) {
             (event.toolName && !isReadOnlyToolName(event.toolName)));
         // Claude Code and Codex hooks carry no assistant text, so at a capture
         // boundary the host's own transcript supplies the turns' closing replies.
+        // Once this host session has worked under an opted-out or differently bound root, its
+        // transcript may hold turns from there, so none of it travels with this root's capture.
         const transcriptSummary = captureRuntimeEnabled && captureTriggerForEvent(event.event) && event.transcriptPath
-            ? hostTranscriptSummary(event, options.baseDir)
+            ? (hostSessionMayCarryBlockedTurns(hostSessionKey, credentialOptions?.baseDir)
+                ? withheldTranscriptSummary(event, options.baseDir)
+                : hostTranscriptSummary(event, options.baseDir))
             : undefined;
         // options.baseDir is the account state directory by now; backups live in the brain home.
         if (isSessionStartEvent(event.event))

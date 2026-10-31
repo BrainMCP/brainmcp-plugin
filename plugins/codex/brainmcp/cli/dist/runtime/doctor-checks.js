@@ -151,7 +151,7 @@ function readFileCredentialHealth(credPath) {
 }
 export function checkRuntimeDrift(expectedVersion, baseDir) {
     const installed = listInstalledRuntimes(baseDir);
-    // Managed hook commands name the shim, so it decides which runtime hooks run.
+    // Managed hook commands run the shim, so it decides which runtime hooks run.
     // Without one, an earlier init's hooks name a versioned runtime directly.
     const shimTarget = readRuntimeShimTarget(baseDir);
     if (shimTarget !== undefined && (shimTarget !== expectedVersion || !installed.some((r) => r.version === shimTarget))) {
