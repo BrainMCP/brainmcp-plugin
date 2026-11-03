@@ -561,6 +561,9 @@ export class VaultCredentialStore {
     async clear() {
         const marker = this.backendMarkerPath();
         const key = this.secretKey();
+        // Neither a marker nor a recorded failure means this home wrote nothing there, as with a file
+        // sign-in on a host whose keyring does not work. That delete is best effort: logout must not fail.
+        const holdsCopy = existsSync(marker) || existsSync(this.pendingDeletePath());
         try {
             if (existsSync(marker)) {
                 assertNotSymlink(marker);
@@ -568,14 +571,16 @@ export class VaultCredentialStore {
             }
         }
         finally {
-            await this.deleteVaultItem(key);
+            await this.deleteVaultItem(key, holdsCopy);
         }
     }
-    async deleteVaultItem(key) {
+    async deleteVaultItem(key, holdsCopy = true) {
         try {
             await this.vault.deleteSecret(key);
         }
         catch {
+            if (!holdsCopy)
+                return;
             try {
                 writeAtomic0600(this.pendingDeletePath(), JSON.stringify({ key, recordedAt: new Date().toISOString() }));
             }

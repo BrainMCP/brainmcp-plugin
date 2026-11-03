@@ -83,7 +83,8 @@ export function pruneLocalState(options) {
     let logRotated = false;
     // 1. Prune queue items
     try {
-        const items = listQueueItems(baseDir);
+        // Listing creates the directory, and this also runs for a home that never turned capture on.
+        const items = fs.existsSync(path.join(baseDir, 'queue')) ? listQueueItems(baseDir) : [];
         for (const item of items) {
             const createdAtMs = new Date(item.createdAt).getTime();
             if (now - createdAtMs > maxQueueAge || item.status === 'delivered') {

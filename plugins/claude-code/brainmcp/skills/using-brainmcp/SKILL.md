@@ -74,4 +74,4 @@ MCP endpoint: https://mcp.brainmcp.ai/mcp
 - Files: when advertised, use brain_file_upload then the returned curl command then brain_file_attach. Inline contentText/contentBase64 is limited to 256 KiB decoded. Use a stable idempotencyKey for attachment retries. brain_file_read returns a private short-lived download URL, paged text, small images and a raw-byte resource; never save transfer URLs in Brain. assets:read/assets:write require incremental consent. Attaching and detach_asset stay proposals; an upload alone is not attached. Encrypted-secret node files cannot be read by agents.
 - Use brain_session_digest only as a disclosed fallback when the user explicitly asks to capture unstructured session learnings — never as an automatic dump of every session.
 
-Guidance version: 2026.10.28
+Guidance version: 2026.11.02

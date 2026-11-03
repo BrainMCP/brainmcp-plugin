@@ -11,6 +11,8 @@ import { cliPackageVersion } from '../runtime/installer.js';
 import { doctor, init, initAll, printConfig, remove, } from './index.js';
 import { login, logout, whoami } from './auth.js';
 import { bindProject } from './bind.js';
+import { RUN_DUE_DEFAULT_TIMEOUT_MINUTES, RUN_DUE_MAX_TIMEOUT_MINUTES, RUN_DUE_PROMPT_PLACEHOLDER, runDue } from './run-due.js';
+import { flagChanged } from './flag-changed.js';
 import { runHookRuntimeCli } from '../runtime/index.js';
 import { captureStatus, captureEnable, captureDisable, captureNow, capturePurgeLocal, capturePurgePreview, } from './capture.js';
 export const HELP = `brainmcp — configure BrainMCP for agent projects and authenticate companion CLI
@@ -35,6 +37,8 @@ Usage:
   brainmcp capture [enable|disable|status|now|purge-local] [--dry-run] [--workspace <uuid>] [--include-prompts] [--yes] [--json]
   brainmcp bind [--workspace <uuid>] [--root <dir>] [--yes] [--json]
   brainmcp unbind [--root <dir>] [--yes] [--json]
+  brainmcp run-due [--workspace <uuid>] [--root <dir>] [--dry-run] [--timeout-minutes <n>] [--json] -- <agent command>
+  brainmcp flag-changed [--base <ref>] [--head <ref>] [--stdin] [--commit <sha>] [--dry-run] [--json]
   brainmcp --help | -h
   brainmcp --version | -v
 
@@ -47,12 +51,24 @@ bind writes the project's .brainmcp.json workspace binding (the nearest one insi
 at the Git root; outside a Git repository or in your home directory only with an explicit --root, which binds
 exactly <dir>/.brainmcp.json), so agents there orient to that workspace and capture never lands in another;
 bind alone shows the binding.
+run-due is for your cron or CI: when tasks are due or digests are waiting, it runs your own agent command with the
+work as its prompt (on stdin, or in place of a ${RUN_DUE_PROMPT_PLACEHOLDER} argument), and starts nothing otherwise. It needs
+\`brainmcp login\` once on that machine, and the agent needs its own sign-in to brain.
+  brainmcp run-due -- claude -p ${RUN_DUE_PROMPT_PLACEHOLDER} --allowedTools 'mcp__brain__*'
+flag-changed marks notes whose source file changed as needing review, from git diff <base> <head> (default
+HEAD~1 and HEAD) or from paths on stdin. For CI: set BRAINMCP_SERVICE_TOKEN to a service connection with the
+kb:source_changes scope. It exits 0 whether or not notes were flagged.
 Every mutation previews a diff and needs confirmation unless a trailing CLI --yes is supplied.
 The leading npx --yes above accepts npm's package download; it does not skip the file preview.`;
+/** Everything of `args` that belongs to this CLI: `run-due` hands what follows `--` to the agent. */
+function ownArguments(args) {
+    const separator = args[0] === 'run-due' ? args.indexOf('--') : -1;
+    return separator === -1 ? args : args.slice(0, separator);
+}
 /** Positional actions; only `capture` takes them. */
 const CAPTURE_ACTIONS = new Set(['enable', 'disable', 'status', 'now', 'purge-local']);
 export function parseCliArgs(args) {
-    const [command, ...rawOptions] = args;
+    const [command, ...rawOptions] = ownArguments(args);
     const result = {
         command,
         yes: false,
@@ -73,6 +89,7 @@ export function parseCliArgs(args) {
         allowFileCredentials: false,
         serviceTokenStdin: false,
         storeServiceToken: false,
+        stdin: false,
     };
     for (let index = 0; index < rawOptions.length; index += 1) {
         const option = rawOptions[index];
@@ -127,8 +144,45 @@ export function parseCliArgs(args) {
         }
         else if (option === '--root')
             result.root = readValue(rawOptions, ++index, option);
+        else if (option === '--timeout-minutes') {
+            const minutes = Number(readValue(rawOptions, ++index, option));
+            if (!Number.isInteger(minutes) || minutes < 1 || minutes > RUN_DUE_MAX_TIMEOUT_MINUTES) {
+                throw new Error(`--timeout-minutes must be a whole number from 1 to ${RUN_DUE_MAX_TIMEOUT_MINUTES}.`);
+            }
+            result.timeoutMinutes = minutes;
+        }
+        else if (option === '--base')
+            result.base = readValue(rawOptions, ++index, option);
+        else if (option === '--head')
+            result.head = readValue(rawOptions, ++index, option);
+        else if (option === '--commit')
+            result.commit = readValue(rawOptions, ++index, option);
+        else if (option === '--stdin')
+            result.stdin = true;
         else
             throw new Error(`Unknown option: ${option}`);
+    }
+    if (command === 'run-due') {
+        const separator = args.indexOf('--');
+        if (separator !== -1)
+            result.agentCommand = args.slice(separator + 1);
+        if (!result.dryRun && !result.agentCommand?.length) {
+            throw new Error(`Name your agent after \`--\`, for example: brainmcp run-due -- claude -p ${RUN_DUE_PROMPT_PLACEHOLDER} --allowedTools 'mcp__brain__*'`);
+        }
+    }
+    else if (result.timeoutMinutes !== undefined) {
+        throw new Error('--timeout-minutes is valid only with `run-due`.');
+    }
+    if (command === 'flag-changed') {
+        if (result.stdin && (result.base || result.head)) {
+            throw new Error('Use --stdin or --base/--head, not both.');
+        }
+        if (result.commit && !/^[0-9a-f]{7,64}$/i.test(result.commit)) {
+            throw new Error('--commit must be a hexadecimal commit id of 7 to 64 characters.');
+        }
+    }
+    else if (result.base || result.head || result.commit || result.stdin) {
+        throw new Error('--base, --head, --commit and --stdin are valid only with `brainmcp flag-changed`.');
     }
     if (command === 'capture') {
         const actions = [result.enable, result.disable, result.status, result.now, result.purge].filter(Boolean);
@@ -222,11 +276,12 @@ export async function dispatch(rawArgs, context = {}) {
     }
     // Anywhere on the line, these only print, so `init --help --yes` never runs
     // init. No option takes a value starting with `-`, so neither is ever a value.
-    if (rawArgs.includes('--help') || rawArgs.includes('-h')) {
+    const ownArgs = ownArguments(rawArgs);
+    if (ownArgs.includes('--help') || ownArgs.includes('-h')) {
         output(HELP);
         return CLI_EXIT_CODES.SUCCESS;
     }
-    if (command === 'version' || rawArgs.includes('--version') || rawArgs.includes('-v')) {
+    if (command === 'version' || ownArgs.includes('--version') || ownArgs.includes('-v')) {
         output(cliPackageVersion());
         return CLI_EXIT_CODES.SUCCESS;
     }
@@ -393,6 +448,34 @@ export async function dispatch(rawArgs, context = {}) {
                     output,
                     confirm: confirmFn,
                 });
+            case 'run-due':
+                return await runDue({
+                    cwd: parsed.root ?? currentRoot,
+                    agentCommand: parsed.agentCommand ?? [],
+                    workspace: parsed.workspace,
+                    dryRun: parsed.dryRun,
+                    json: parsed.json,
+                    timeoutMinutes: parsed.timeoutMinutes ?? RUN_DUE_DEFAULT_TIMEOUT_MINUTES,
+                    baseDir: context.baseDir,
+                    store: context.store,
+                    apiClient: context.apiClient,
+                    output,
+                });
+            case 'flag-changed':
+                await flagChanged({
+                    apiClient: context.apiClient,
+                    base: parsed.base,
+                    commit: parsed.commit,
+                    cwd: parsed.root ?? currentRoot,
+                    dryRun: parsed.dryRun,
+                    fromStdin: parsed.stdin,
+                    head: parsed.head,
+                    json: parsed.json,
+                    output,
+                    runtimeHome: context.baseDir,
+                    store: context.store,
+                });
+                return CLI_EXIT_CODES.SUCCESS;
             default:
                 console.error(`Unknown command: ${parsed.command}\n\n${HELP}`);
                 return CLI_EXIT_CODES.USAGE_ERROR;

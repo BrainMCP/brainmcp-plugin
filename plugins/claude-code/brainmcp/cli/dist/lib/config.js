@@ -1,4 +1,4 @@
-import { BRAIN_MCP_ENDPOINT, BRAINMCP_CLI_CLIENTS, GUIDANCE_VERSION, MCP_CLIENT_PROFILES, MCP_OAUTH_CLIENT_IDS, ANTIGRAVITY_RULES_FRONTMATTER, VSCODE_USER_INSTRUCTIONS_FRONTMATTER, buildCodexConfigToml, buildProjectInstructionBlock, renderCursorMdc, } from '../agent-config.js';
+import { BRAIN_MCP_ENDPOINT, BRAINMCP_CLI_CLIENTS, GUIDANCE_VERSION, MCP_CLIENT_PROFILES, MCP_OAUTH_CLIENT_IDS, ANTIGRAVITY_RULES_FRONTMATTER, VSCODE_USER_INSTRUCTIONS_FRONTMATTER, buildCodexConfigToml, buildInstalledInstructionBlock, renderCursorMdc, } from '../agent-config.js';
 import { isWorkspaceUuid, normalizeWorkspaceId } from './cli-contracts.js';
 export const BRAIN_ENDPOINT = BRAIN_MCP_ENDPOINT;
 export const CLIENT_IDS = BRAINMCP_CLI_CLIENTS;
@@ -133,7 +133,7 @@ export function renderGuidance(client, workspaceId) {
             throw new Error('Cursor guidance renderer did not return frontmatter.');
         return `${MARKER_START}\n${rendered.slice(frontmatter.length).trim()}\n${MARKER_END}\n`;
     }
-    return `${MARKER_START}\n${buildProjectInstructionBlock({ workspaceId })}\n${MARKER_END}\n`;
+    return `${MARKER_START}\n${buildInstalledInstructionBlock({ workspaceId })}\n${MARKER_END}\n`;
 }
 /** Pre-static-OAuth Antigravity installer shape. `init` upgrades it; `remove` still owns it. */
 export const LEGACY_ANTIGRAVITY_SERVER_CONFIG = { serverUrl: BRAIN_MCP_ENDPOINT };

@@ -189,6 +189,10 @@ export class ApiClient {
                 error.status = res.status;
                 if (code)
                     error.code = code;
+                // Seconds only: the API never sends the HTTP-date form.
+                const retryAfter = Number(res.headers.get('Retry-After'));
+                if (res.headers.has('Retry-After') && Number.isFinite(retryAfter) && retryAfter >= 0)
+                    error.retryAfterSeconds = retryAfter;
                 throw error;
             }
             if (res.status === 204) {

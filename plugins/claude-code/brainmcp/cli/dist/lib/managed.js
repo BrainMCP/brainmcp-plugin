@@ -47,10 +47,15 @@ export function upsertTomlBlock(existing, client) {
     assertNoConflictingManagedBlock(current, 'toml');
     const block = renderTomlServer(client);
     const existingStart = managedStarts(current, 'toml')[0];
-    if (existingStart) {
-        return current.replace(new RegExp(`${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}\\n?`), block);
+    const updated = existingStart
+        ? current.replace(new RegExp(`${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}\\n?`), block)
+        : replaceTomlBrainTables(current, block);
+    // A second definition makes the whole file invalid TOML, so it is never written. An array of tables repeats by design.
+    const brainTables = splitTomlSections(updated).filter(({ isArray }) => !isArray).map(({ name }) => name).filter(isTomlBrainTable);
+    if (new Set(brainTables).size !== brainTables.length) {
+        throw new CliConfigurationError('Refusing to write a duplicate [mcp_servers.brain] table. Remove the copy outside the BrainMCP markers first.');
     }
-    return replaceTomlBrainTables(current, block);
+    return updated;
 }
 export function removeTomlBlock(existing) {
     if (existing === undefined)
@@ -218,6 +223,9 @@ function sameJsonValue(left, right) {
     return leftKeys.length === rightKeys.length &&
         leftKeys.every((key, index) => key === rightKeys[index] && sameJsonValue(leftRecord[key], rightRecord[key]));
 }
+function isTomlBrainTable(name) {
+    return name === 'mcp_servers.brain' || name.startsWith('mcp_servers.brain.');
+}
 function escapeRegex(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -226,7 +234,7 @@ function escapeRegex(value) {
  * value, even when old markers were removed. Unrelated TOML tables stay intact.
  */
 function replaceTomlBrainTables(current, block) {
-    const ranges = splitTomlSections(current).filter((section) => section.name === 'mcp_servers.brain' || section.name.startsWith('mcp_servers.brain.'));
+    const ranges = splitTomlSections(current).filter((section) => isTomlBrainTable(section.name));
     const mergedRanges = ranges.reduce((merged, range) => {
         const previous = merged.at(-1);
         const contentEnd = tomlSectionContentEnd(current, range);
@@ -716,6 +724,31 @@ function matchingContainer(source, open, openCharacter, closeCharacter, label) {
     }
     throw new Error(`Unterminated JSON ${label}.`);
 }
+const TOML_BARE_KEY = /^[A-Za-z0-9_-]+$/;
+/**
+ * A dotted TOML key in one spelling, so `mcp_servers."brain"`, `mcp_servers.'brain'` and
+ * `mcp_servers . brain` compare equal: bare where the segment allows it, else JSON-quoted, which
+ * keeps `"a.b"` apart from `a.b`. Text that is not a key this can read comes back as written.
+ */
+function canonicalTomlKey(raw) {
+    const segments = [];
+    let rest = raw.trim();
+    while (rest) {
+        const match = /^(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*(\.\s*|$)/.exec(rest);
+        if (!match)
+            return raw.trim();
+        try {
+            segments.push(match[1] !== undefined ? JSON.parse(`"${match[1]}"`) : match[2] ?? match[3]);
+        }
+        catch {
+            return raw.trim();
+        }
+        rest = rest.slice(match[0].length);
+        if (!rest && match[4])
+            return raw.trim();
+    }
+    return segments.map((segment) => (TOML_BARE_KEY.test(segment) ? segment : JSON.stringify(segment))).join('.');
+}
 /**
  * The one TOML table splitter: `init`/`remove` (`replaceTomlBrainTables`),
  * `doctor` and the duplicate-scope check all read sections through it. A
@@ -730,7 +763,7 @@ export function splitTomlSections(current) {
         const start = header.index;
         const end = headers[index + 1]?.index ?? current.length;
         return {
-            name: header[2].trim(),
+            name: canonicalTomlKey(header[2]),
             isArray: header[1] === '[' && header[3] === ']',
             start,
             end,

@@ -385,6 +385,22 @@ export async function doctor(options) {
                     : `no ${otherScope}-scope brain entry`,
         ]);
     }
+    if (guidance !== undefined && /brainmcp:managed:start/.test(guidance)) {
+        // The block loads at both scopes, so the agent reads it twice every session.
+        // Informational: nothing is removed for the user.
+        const otherScope = oppositeScope(options.scope);
+        const otherTarget = resolveTarget({ ...options, scope: otherScope }, targetFor(client, otherScope));
+        if (otherTarget.guidancePath !== target.guidancePath) {
+            const otherGuidance = await readText(otherTarget.guidancePath);
+            if (otherGuidance !== undefined && /brainmcp:managed:start/.test(otherGuidance)) {
+                checks.push([
+                    'duplicate guidance',
+                    true,
+                    `warning: the brain guidance block is installed at both ${options.scope} scope (${target.guidancePath}) and ${otherScope} scope (${otherTarget.guidancePath}), so the agent loads it twice. Keep one: delete the text between the brainmcp:managed markers from one of the two files. Doctor does not remove either`,
+                ]);
+            }
+        }
+    }
     const fetchImpl = options.fetch ?? fetch;
     const probeTimeoutMs = options.probeTimeoutMs ?? DOCTOR_PROBE_TIMEOUT_MS;
     // Probes run in parallel. Each one, body read included, has its own deadline

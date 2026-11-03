@@ -462,6 +462,14 @@ export function enableCapture(options) {
         },
     };
     const workspaceId = options?.workspaceId?.trim();
+    const enabledWorkspaceId = workspaceId && isWorkspaceUuid(workspaceId) ? workspaceId : current.enabledWorkspaceId;
+    const includePrompts = Boolean(options?.includePrompts);
+    // Repeating the consent already on file changes nothing. A queued automatic item is sent only
+    // under the revision it was queued at, so a new revision here would cancel it.
+    if (captureConsentActive(current) && Boolean(current.consent.includePrompts) === includePrompts
+        && current.enabledWorkspaceId === enabledWorkspaceId) {
+        return current;
+    }
     const previousRevision = current.consent.revision ?? 0;
     // A disabled consent at a revision above 0 was written by a disable. One an
     // older CLI (0.1.38 and earlier) wrote carries no lastDisabledRevision, so it
@@ -475,13 +483,13 @@ export function enableCapture(options) {
             ...current.consent,
             ...(lastDisabledRevision !== undefined ? { lastDisabledRevision } : {}),
             captureEnabled: true,
-            includePrompts: Boolean(options?.includePrompts),
+            includePrompts,
             // Consent given now is to the current policy, even when an older one is on file.
             policyVersion: CAPTURE_POLICY_VERSION,
             consentedAt: new Date(options?.now ?? Date.now()).toISOString(),
             revision: (current.consent.revision ?? 0) + 1,
         },
-        enabledWorkspaceId: workspaceId && isWorkspaceUuid(workspaceId) ? workspaceId : current.enabledWorkspaceId,
+        enabledWorkspaceId,
     };
     writePreferences(updated, options?.baseDir);
     return updated;

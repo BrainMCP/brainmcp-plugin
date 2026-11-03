@@ -5,6 +5,10 @@ const VAULT_SERVICE = 'brainmcp.credentials';
 export const LEGACY_VAULT_ACCOUNT = 'oauth';
 const VAULT_ACCOUNT = LEGACY_VAULT_ACCOUNT;
 const EXEC_TIMEOUT_MS = 4_000;
+/** `security` reports errSecItemNotFound as exit 44. */
+const MACOS_ITEM_NOT_FOUND_EXIT = 44;
+/** ERROR_NOT_FOUND (0x80070490) as PowerShell's signed HResult. */
+const WINDOWS_NOT_FOUND_HRESULT = -2147023728;
 export function vaultAccountKey(accountId) {
     return `oauth:${accountId}`;
 }
@@ -68,8 +72,10 @@ export class UnavailableSecretVault {
 }
 export class MacosSecurityVault {
     spawnProcess;
-    constructor(spawnProcess = spawn) {
+    runCommand;
+    constructor(spawnProcess = spawn, runCommand = execFileAsync) {
         this.spawnProcess = spawnProcess;
+        this.runCommand = runCommand;
     }
     name = 'macos-keychain';
     async isAvailable() {
@@ -132,17 +138,21 @@ export class MacosSecurityVault {
     async deleteSecret(key = VAULT_ACCOUNT) {
         assertVaultKey(key);
         try {
-            await execFileAsync('security', ['delete-generic-password', '-s', VAULT_SERVICE, '-a', key], { timeout: EXEC_TIMEOUT_MS });
+            await this.runCommand('security', ['delete-generic-password', '-s', VAULT_SERVICE, '-a', key], { timeout: EXEC_TIMEOUT_MS });
         }
-        catch {
-            // Missing item is success for logout.
+        catch (error) {
+            // Only a missing item counts as deleted; a locked keychain or a timeout left it in place.
+            if (error.code !== MACOS_ITEM_NOT_FOUND_EXIT)
+                throw new Error('macOS keychain delete failed');
         }
     }
 }
 export class LinuxSecretToolVault {
     spawnProcess;
-    constructor(spawnProcess = spawn) {
+    runCommand;
+    constructor(spawnProcess = spawn, runCommand = execFileAsync) {
         this.spawnProcess = spawnProcess;
+        this.runCommand = runCommand;
     }
     name = 'libsecret';
     async isAvailable() {
@@ -192,17 +202,23 @@ export class LinuxSecretToolVault {
     async deleteSecret(key = VAULT_ACCOUNT) {
         assertVaultKey(key);
         try {
-            await execFileAsync('secret-tool', ['clear', 'service', VAULT_SERVICE, 'account', key], { timeout: EXEC_TIMEOUT_MS });
+            await this.runCommand('secret-tool', ['clear', 'service', VAULT_SERVICE, 'account', key], { timeout: EXEC_TIMEOUT_MS });
         }
-        catch {
-            // Missing item is success for logout.
+        catch (error) {
+            // `secret-tool clear` exits 1 both ways: silently when nothing matched, with the error on
+            // stderr when it failed. A timeout or a missing tool has no exit status of 1.
+            const { code, stderr } = error;
+            if (code !== 1 || String(stderr ?? '').trim() !== '')
+                throw new Error('secret-tool delete failed');
         }
     }
 }
 export class WindowsCredentialVault {
     spawnProcess;
-    constructor(spawnProcess = spawn) {
+    runCommand;
+    constructor(spawnProcess = spawn, runCommand = execFileAsync) {
         this.spawnProcess = spawnProcess;
+        this.runCommand = runCommand;
     }
     name = 'windows-credential-manager';
     async isAvailable() {
@@ -253,16 +269,15 @@ export class WindowsCredentialVault {
     }
     async deleteSecret(key = VAULT_ACCOUNT) {
         assertVaultKey(key);
-        try {
-            await execFileAsync('powershell.exe', [
-                '-NoProfile',
-                '-Command',
-                `try { $v = New-Object Windows.Security.Credentials.PasswordVault; $v.Remove($v.Retrieve('${VAULT_SERVICE}','${key}')) } catch {}`,
-            ], { timeout: EXEC_TIMEOUT_MS });
-        }
-        catch {
-            // ignore
-        }
+        // Exits 0 only when the item was removed or Retrieve says it is not there. PowerShell can wrap
+        // the COM exception, so the inner one is checked too.
+        await this.runCommand('powershell.exe', [
+            '-NoProfile',
+            '-Command',
+            `$v = New-Object Windows.Security.Credentials.PasswordVault; try { $c = $v.Retrieve('${VAULT_SERVICE}','${key}') } catch { if (@($_.Exception.HResult, $_.Exception.InnerException.HResult) -contains ${WINDOWS_NOT_FOUND_HRESULT}) { exit 0 }; exit 1 }; try { $v.Remove($c) } catch { exit 1 }`,
+        ], { timeout: EXEC_TIMEOUT_MS }).catch(() => {
+            throw new Error('Windows PasswordVault delete failed');
+        });
     }
 }
 export function createPlatformVault() {

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { CAPTURE_POLICY_VERSION } from '../agent-config.js';
-import { filterRelativePaths } from '../lib/cli-contracts.js';
+import { filterRelativePaths, UNATTENDED_RUN_ENV } from '../lib/cli-contracts.js';
 import { emitHostOutput } from '../hooks/adapters.js';
 import { hostSessionHasBlockedRoot, markHostSessionBlockedRoot, markSessionNudged, queueSessionCapture, recordSessionEvent, } from './session.js';
 import { logRuntimeEvent } from './diagnostics.js';
@@ -412,7 +412,7 @@ export async function dispatchHookEvent(event, options) {
         const roots = event.workspaceRoots?.length ? event.workspaceRoots : event.cwd ? [event.cwd] : [];
         const policies = roots.map(readProjectCaptureRestrictions);
         const projectPolicy = {
-            captureDisabled: policies.some((policy) => policy.captureDisabled) || projectBindingBlocksCapture(roots, prefs?.enabledWorkspaceId),
+            captureDisabled: process.env[UNATTENDED_RUN_ENV] === '1' || policies.some((policy) => policy.captureDisabled) || projectBindingBlocksCapture(roots, prefs?.enabledWorkspaceId),
             promptsDisabled: policies.some((policy) => policy.promptsDisabled),
         };
         // Marks live in the Brain home (credentialOptions.baseDir), across accounts.
@@ -456,6 +456,11 @@ export async function dispatchHookEvent(event, options) {
                 outputPayload: hostOutput(event),
             };
         }
+        // Every SessionStart, capture on or off: what was stored before `capture disable` or an opted-out
+        // root still ages out. options.baseDir is the account state directory by now; backups live in the
+        // brain home.
+        if (isSessionStartEvent(event.event))
+            pruneLocalState({ baseDir: options.baseDir, brainHome: credentialOptions?.baseDir ?? getBrainHome() });
         // Orientation-only SessionStart must not create a session ledger before
         // capture consent. It may read or refresh the authorization-scoped orient
         // cache, but it stores no session, prompt, tool, path, or summary record.
@@ -496,9 +501,6 @@ export async function dispatchHookEvent(event, options) {
                 ? withheldTranscriptSummary(event, options.baseDir)
                 : hostTranscriptSummary(event, options.baseDir))
             : undefined;
-        // options.baseDir is the account state directory by now; backups live in the brain home.
-        if (isSessionStartEvent(event.event))
-            pruneLocalState({ baseDir: options.baseDir, brainHome: credentialOptions?.baseDir ?? getBrainHome() });
         const ledger = await recordSessionEvent({
             sessionKey: event.sessionKey,
             baseDir: options?.baseDir,

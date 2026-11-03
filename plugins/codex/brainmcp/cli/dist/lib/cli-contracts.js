@@ -23,6 +23,12 @@ export const CLI_EXIT_CODES = {
     CONFIGURATION_ERROR: 5,
     NETWORK_ERROR: 6,
 };
+/**
+ * Set on an agent `brainmcp run-due` launches. Hooks in that session never
+ * capture it: digests from processing digests would refill the queue that run
+ * is emptying, and each one costs a unit.
+ */
+export const UNATTENDED_RUN_ENV = 'BRAINMCP_UNATTENDED_RUN';
 /** A local configuration problem the user must repair; commands exit with CONFIGURATION_ERROR. */
 export class CliConfigurationError extends Error {
     constructor(message) {
