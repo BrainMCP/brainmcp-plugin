@@ -127,9 +127,15 @@ export function acquireRunDueLock(workspaceId, timeoutMs, baseDir) {
     return null;
 }
 /**
+ * How long processes the agent left behind may keep running once it exits: a wrapper's workers
+ * finishing up. After that they are stopped (a helper daemon would otherwise hold the run open until
+ * the timeout) and the run reports how the agent itself ended.
+ */
+export const AGENT_LINGER_MS = 5 * 60_000;
+/**
  * Runs the agent to its exit. Its stdout goes to stderr under `--json`, so stdout stays one JSON document.
  * Off Windows the agent leads its own process group, so a stop reaches the workers a wrapper starts too,
- * and the run ends, releasing the lock, only once the whole group has gone.
+ * and the run ends, releasing the lock, only once the whole group has gone (stopped after `AGENT_LINGER_MS`).
  */
 export function runAgent(input) {
     const usesPlaceholder = input.agentCommand.includes(RUN_DUE_PROMPT_PLACEHOLDER);
@@ -163,6 +169,7 @@ export function runAgent(input) {
             }
         };
         let timedOut = false;
+        let agentExited = false;
         let stoppedAt;
         let killTimer;
         const stop = () => {
@@ -170,8 +177,11 @@ export function runAgent(input) {
             signalAgent('SIGTERM');
             killTimer ??= setTimeout(() => signalAgent('SIGKILL'), AGENT_STOP_GRACE_MS);
         };
+        // The deadline still stops leftovers after the agent has exited, so the lock stays bounded, but
+        // only an agent still running at it makes the run a timeout.
         const timer = setTimeout(() => {
-            timedOut = true;
+            if (!agentExited)
+                timedOut = true;
             stop();
         }, input.timeoutMs);
         // A cancelled CI job or Ctrl-C ends the agent too, and this process still releases its lock.
@@ -186,13 +196,21 @@ export function runAgent(input) {
             resolve(outcome);
         };
         child.once('error', (error) => finish({ kind: 'not_started', message: error.message }));
+        // `close` can wait for a helper holding an inherited pipe; the agent itself is done at `exit`.
+        child.once('exit', () => { agentExited = true; });
         // A wrapper can exit before its workers, whether it finished or was stopped. The run ends when the whole
-        // group has: until then the timeout still applies, and a stopped group gets the grace and the kill.
+        // group has: until then the deadline still stops it, and a stopped group gets the grace and the kill.
+        // What is left at the linger or the deadline, whichever comes first, is stopped without making the
+        // run a timeout: the run reports how the agent itself ended.
         child.once('close', (code, signal) => {
+            agentExited = true;
+            const linger = setTimeout(() => { if (groupAlive())
+                stop(); }, input.lingerMs ?? AGENT_LINGER_MS);
             const settle = () => {
                 const giveUp = stoppedAt !== undefined && Date.now() >= stoppedAt + AGENT_STOP_GRACE_MS + 2_000;
                 if (groupAlive() && !giveUp)
                     return void setTimeout(settle, 250);
+                clearTimeout(linger);
                 finish(timedOut ? { kind: 'timed_out' } : { kind: 'exited', code, signal });
             };
             settle();
