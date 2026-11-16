@@ -1,6 +1,6 @@
 import { cwd, stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
-import { BRAINMCP_CLI_PACKAGE_SPEC, BRAINMCP_GLOBAL_CLIENTS, BRAINMCP_PLUGIN_ID, BRAINMCP_PLUGIN_REPOSITORY, } from '../agent-config.js';
+import { BRAINMCP_CLI_PACKAGE_SPEC, BRAINMCP_GLOBAL_CLIENTS, BRAINMCP_PLUGIN_ID, BRAINMCP_PLUGIN_REPOSITORY, CLAUDE_CODE_BRAIN_ALLOWED_TOOLS_FLAG, } from '../agent-config.js';
 import { CLI_EXIT_CODES, CliConfigurationError } from '../lib/cli-contracts.js';
 import { assertClientId, CLIENT_IDS, clientLabel, resolveWorkspace } from '../lib/config.js';
 import { OAuthGrantRejectedError } from '../lib/oauth-client.js';
@@ -54,7 +54,7 @@ bind alone shows the binding.
 run-due is for your cron or CI: when tasks are due or digests are waiting, it runs your own agent command with the
 work as its prompt (on stdin, or in place of a ${RUN_DUE_PROMPT_PLACEHOLDER} argument), and starts nothing otherwise. It needs
 \`brainmcp login\` once on that machine, and the agent needs its own sign-in to brain.
-  brainmcp run-due -- claude -p ${RUN_DUE_PROMPT_PLACEHOLDER} --allowedTools 'mcp__brain__*'
+  brainmcp run-due -- claude -p ${RUN_DUE_PROMPT_PLACEHOLDER} ${CLAUDE_CODE_BRAIN_ALLOWED_TOOLS_FLAG}
 flag-changed marks notes whose source file changed as needing review, from git diff <base> <head> (default
 HEAD~1 and HEAD) or from paths on stdin. For CI: set BRAINMCP_SERVICE_TOKEN to a service connection with the
 kb:source_changes scope. It exits 0 whether or not notes were flagged.
@@ -167,7 +167,7 @@ export function parseCliArgs(args) {
         if (separator !== -1)
             result.agentCommand = args.slice(separator + 1);
         if (!result.dryRun && !result.agentCommand?.length) {
-            throw new Error(`Name your agent after \`--\`, for example: brainmcp run-due -- claude -p ${RUN_DUE_PROMPT_PLACEHOLDER} --allowedTools 'mcp__brain__*'`);
+            throw new Error(`Name your agent after \`--\`, for example: brainmcp run-due -- claude -p ${RUN_DUE_PROMPT_PLACEHOLDER} ${CLAUDE_CODE_BRAIN_ALLOWED_TOOLS_FLAG}`);
         }
     }
     else if (result.timeoutMinutes !== undefined) {

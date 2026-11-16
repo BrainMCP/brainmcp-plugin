@@ -10,7 +10,7 @@ import { withRequestDeadline } from '../lib/http.js';
 import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, captureConsentActive, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, queueProjectRoots, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
 import { canEnqueueCapture } from './flush.js';
 import { readTranscriptSummary } from './transcript-summary.js';
-import { isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
+import { companionOrientationFailedMessage, isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
 import { pluginSessionStartContext } from './plugin-guidance.js';
 import { ApiClient } from '../lib/api-client.js';
 import { detectHostPlugin, isPluginHost, pluginRunsHook } from '../lib/host-plugins.js';
@@ -311,6 +311,20 @@ function hostTranscriptSummary(event, baseDir) {
 function pluginContext(event, context, lookup) {
     const roots = event.workspaceRoots?.length ? event.workspaceRoots : event.cwd ? [event.cwd] : [];
     return pluginSessionStartContext(context, { host: event.client, roots, lookup });
+}
+/**
+ * Output for a plugin SessionStart whose dispatch failed or ran out of time (a
+ * slow API, token endpoint, or OS keychain). The plugin has no other way to
+ * deliver its always-on guidance, which is local text, so the hook still sends
+ * it, with a note that companion orientation did not finish.
+ */
+function pluginSessionStartFailureOutput(event, failureClass, lookup) {
+    try {
+        return hostOutput(event, pluginContext(event, companionOrientationFailedMessage([failureClass]), lookup));
+    }
+    catch {
+        return {};
+    }
 }
 function hostOutput(event, additionalContext) {
     try {
@@ -706,15 +720,20 @@ export async function dispatchHookEvent(event, options) {
         };
     }
     catch (err) {
+        const failureClass = dispatchFailureClass(err, controller.signal.aborted);
         logRuntimeEvent('warn', 'hook_dispatch_failed', {
             event: event.event,
             sessionKey: event.sessionKey,
-            error: dispatchFailureClass(err, controller.signal.aborted),
+            error: failureClass,
         }, options?.baseDir);
+        // A hook `init` wrote can send nothing: its guidance is in CLAUDE.md or AGENTS.md.
+        const pluginOutput = event.fromPlugin && isSessionStartEvent(event.event)
+            ? pluginSessionStartFailureOutput(event, failureClass, options?.pluginLookup)
+            : undefined;
         return {
             handled: false,
-            emptyFallback: true,
-            outputPayload: {},
+            emptyFallback: pluginOutput === undefined,
+            outputPayload: pluginOutput ?? {},
             error: err instanceof Error ? err.message : String(err),
         };
     }

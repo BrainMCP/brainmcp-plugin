@@ -210,7 +210,8 @@ export async function doctor(options) {
     const plugin = replacingInit ?? (pluginOnlyProject ? activePlugin : undefined);
     const otherPlugin = plugin ? undefined : activePlugin;
     const pluginOwnsConfig = plugin !== undefined && !hasBrainEntry;
-    // The plugin's using-brainmcp skill stands in for guidance init never wrote.
+    // A plugin cannot write CLAUDE.md or AGENTS.md, so its SessionStart hook sends
+    // the compact always-on guidance that init would have written.
     const pluginCoversGuidance = plugin !== undefined && !hasManagedGuidance;
     // Codex runs a hook from hooks.json only after the user trusts it, init's own
     // included; file presence alone does not mean a hook runs.
@@ -292,7 +293,7 @@ export async function doctor(options) {
         }
     }
     checks.push(['guidance placement', guidance !== undefined || plugin !== undefined, pluginCoversGuidance
-            ? `no managed guidance at ${target.guidancePath}; the plugin's using-brainmcp skill covers it`
+            ? `no managed guidance at ${target.guidancePath}; the plugin's SessionStart hook adds the always-on guidance${isPluginHost(client) && !pluginRunsHook(client, plugin, 'SessionStart') ? ' once you trust it (/hooks in Codex)' : ''}`
             : guidance ? target.guidancePath : `missing ${target.guidancePath}`]);
     if (config !== undefined && !pluginOwnsConfig) {
         try {

@@ -781,6 +781,14 @@ export const BRAINMCP_PLUGIN_REPOSITORY_URL = `https://github.com/${BRAINMCP_PLU
 /** Marketplace name in every host. Installs are keyed `brainmcp@brainmcp`, so it must never change. */
 export const BRAINMCP_PLUGIN_MARKETPLACE_NAME = 'brainmcp';
 export const BRAINMCP_PLUGIN_ID = `${BRAINMCP_PLUGIN_NAME}@${BRAINMCP_PLUGIN_MARKETPLACE_NAME}`;
+/**
+ * `--allowedTools` for a headless Claude Code run that may use brain's tools
+ * and nothing else. Claude Code prefixes a configured `brain` server's tools
+ * `mcp__brain__` and the plugin's server (`plugin:brainmcp:brain`)
+ * `mcp__plugin_brainmcp_brain__`. With the plugin enabled, `init` leaves the
+ * server to it, so naming only the first prefix denies every brain tool there.
+ */
+export const CLAUDE_CODE_BRAIN_ALLOWED_TOOLS_FLAG = `--allowedTools 'mcp__${BRAIN_MCP_SERVER_NAME}__*' 'mcp__plugin_${BRAINMCP_PLUGIN_NAME}_${BRAIN_MCP_SERVER_NAME}__*'`;
 export function buildBrainmcpPluginInstall(host) {
     if (host === 'claude-code') {
         return {

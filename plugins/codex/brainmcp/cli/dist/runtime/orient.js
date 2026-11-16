@@ -254,6 +254,7 @@ export function loginOrientationMessage(loginCommand = DEFAULT_COMPANION_LOGIN_C
 export function reauthOrientationMessage(loginCommand = DEFAULT_COMPANION_LOGIN_COMMAND) {
     return `BrainMCP CLI sign-in expired or was revoked, so companion orientation is off. Only the brainmcp hook is affected: host MCP access is independent, so orient through the host brain_* tools (brain_workspace_overview) before saying Brain is unavailable. Tell the user to run \`${loginCommand}\` to restore companion orientation.`;
 }
+/** `kinds` are {@link OrientFailureKind}s, or a dispatch failure class when the hook failed before or around orientation. */
 export function companionOrientationFailedMessage(kinds) {
     const reasons = [...new Set(kinds)].join(', ');
     return `BrainMCP companion orientation failed (${reasons}). Only the brainmcp hook is affected: host MCP access is independent, so orient through the host brain_* tools (brain_workspace_overview) before saying Brain is unavailable.`;
