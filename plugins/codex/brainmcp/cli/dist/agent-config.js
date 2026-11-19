@@ -60,7 +60,7 @@ export const BRAIN_MCP_INITIAL_SCOPES = [
     'workflows:read',
 ];
 /** Bump when always-on guidance text changes in a way clients should refresh. */
-export const GUIDANCE_VERSION = '2026.11.10';
+export const GUIDANCE_VERSION = '2026.11.19';
 /** Answer grounding is shared by installed guidance, MCP surfaces, and compact hooks. */
 export const ANSWER_GROUNDING_GUIDANCE = [
     'Ground material factual claims in source content you actually read, current code or observed tool/test results. Attribute unchecked Brain statements to their source; stored or applied does not mean independently verified.',
@@ -535,7 +535,7 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
         section: 'start',
         full: `Orient at session start: call brain_workspace_overview (workspaceId optional when this authorization has a default) and treat returned Rules/Skills/Workflows as binding for the whole session. ${USER_REQUEST_FIRST_GUIDANCE} Action flags: ${buildActionFlagGuidance()}`,
         compact: 'Orient at session start: call brain_workspace_overview and treat returned Rules/Skills/Workflows as binding. The user\'s request comes first and recommendedNextActions serve it: handle blocksAgentWork actions before Brain-dependent work, surface mustSurfaceToUser actions before you finish, and ask before a requiresExplicitUserAuthorization action (a status request is not permission). Always mention other pending work (due Workflows, digests, review); run it only if the user approves.',
-        essential: 'User request first, after blocksAgentWork actions. Always mention due work; run it only if the user approves. Surface mustSurfaceToUser; ask before requiresExplicitUserAuthorization.',
+        essential: 'User request first after blocksAgentWork. Always mention due work; run it only if the user approves. Surface mustSurfaceToUser. Ask on requiresExplicitUserAuthorization.',
     },
     {
         section: 'start',
@@ -552,8 +552,8 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
     {
         section: 'work',
         full: `Before non-trivial work, call brain_node_search with the task intent and use what it returns. Its default working set includes bounded top-node content and one-hop context; use brain_node_read for exact truncated content and broader reads only when needed. ${CONTEXT_RETRIEVAL_GUIDANCE}`,
-        compact: 'Before non-trivial work, call brain_node_search with the task intent and use what it returns; use brain_node_read for exact truncated content and broader reads only when needed. Follow responseCap.nextCall and content paging; a truncated or empty result is not proof that knowledge is absent. Reuse fresh context within a task. Stop retrieving when you have the decisions, constraints, and evidence the task needs.',
-        essential: 'Before non-trivial work, brain_node_search; brain_node_read exact content. A truncated/empty result is not proof of absence; follow responseCap.nextCall.',
+        compact: 'Before non-trivial work, use brain_node_search for task context. Use brain_node_read for exact truncated content. Follow responseCap.nextCall and paging. A truncated or empty result is not proof of absence. Reuse fresh context. Stop retrieving when you have enough evidence.',
+        essential: 'Before non-trivial work, brain_node_search. brain_node_read exact text. Follow responseCap.nextCall. Empty/truncated is not proof of absence.',
     },
     {
         section: 'work',
@@ -565,7 +565,7 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
         section: 'work',
         full: `Answer grounding: ${ANSWER_GROUNDING_GUIDANCE} When saved knowledge shapes your answer, name the items you used.`,
         compact: `Answer grounding: ${ANSWER_GROUNDING_BRIEF_GUIDANCE} Never fabricate facts, metrics, citations, links, requirements, or reasons an earlier agent acted. When saved knowledge shapes your answer, name the items you used.`,
-        essential: 'Ground claims in sources you read; name saved items used; say what you cannot determine; never fabricate.',
+        essential: 'Cite sources you read. Name saved items used. Say what you cannot determine. Never fabricate.',
     },
     {
         section: 'save',
@@ -583,7 +583,7 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
         section: 'save',
         full: `Knowledge classes: ${KNOWLEDGE_CLASS_GUIDANCE} ${GRAPH_WRITE_GUIDANCE}`,
         compact: 'Pick the class, then the tool. Core: a project area. Neuron: one fact, decision, or lesson with its why. Rule: a behavioral constraint. Skill: reusable instructions. Workflow: work to run, with steps and an optional schedule. Use brain_remember for one new Neuron, brain_amend for an existing one (append or replace; read exact current content first), and brain_change_propose for the rest. All three feed the same audited proposal pipeline. Use only tools actually advertised.',
-        essential: 'Core=area, Neuron=fact+why, Rule=constraint, Skill=how-to, Workflow=scheduled work. brain_remember: new Neuron; brain_amend: edit one (read first); brain_change_propose: the rest.',
+        essential: 'Core=area, Neuron=fact+why, Rule=constraint, Skill=how-to, Workflow=scheduled work. brain_remember creates. brain_amend edits (read first). brain_change_propose for the rest.',
     },
     {
         section: 'save',
@@ -593,8 +593,8 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
     },
     {
         section: 'save',
-        full: `${SUBMISSION_KEY_GUIDANCE} Proposing and applying are separate: follow review policy and report the returned proposal id and what was applied versus pending; a review-required proposal changes nothing until it is approved. When asked to save something specific, say what you will save and as which kind of item, then give the proposal ID or Review link.`,
-        compact: 'Use a fresh idempotencyKey per new submission; retry an unknown outcome only as the same unchanged request and key. On pending_review_full stop writing, never retry or split; tell the user to approve, reject, or clear old proposals in Review. Proposing is not applying: report applied versus pending. When asked to save something specific, say what you will save and as which kind of item, then give the proposal ID or Review link.',
+        full: `${SUBMISSION_KEY_GUIDANCE} Follow review policy and report the returned proposal ID and state. Distinguish applied versus pending. Confirm application before relying on approved changes. When asked to save something specific, say what you will save and as which kind of item, then give the proposal ID or Review link.`,
+        compact: 'Use a fresh idempotencyKey per new submission; retry an unknown outcome only as the same unchanged request and key. On pending_review_full stop writing, never retry or split; tell the user to approve, reject, or clear old proposals in Review. Report applied versus pending from the receipt. When asked to save something specific, say what you will save and as which kind of item, then give the proposal ID or Review link.',
         essential: 'Writes are proposals: fresh idempotencyKey each; reuse a key only to retry. pending_review_full: stop, tell user. Report proposal id/status.',
     },
     {
@@ -602,6 +602,12 @@ export const PROJECT_INSTRUCTION_OBLIGATIONS = [
         full: `${EMPTY_WORKSPACE_RESPONSE_REQUIREMENT} ${AUTHORIZED_BOOTSTRAP_DETAIL_REQUIREMENT}`,
         compact: 'Empty workspace (no Cores, Neurons, Rules or Skills): offer to save user-supplied knowledge; save only what was requested, and read/status permits no writes. A comprehensive bootstrap needs a repository or a request, plus explicit authorization; then follow the overview\'s detail requirement in one valid proposal. Warn before auto_apply; never call the workspace populated until the proposal is applied.',
         essential: 'Empty workspace: offer to save supplied knowledge. Bootstrap needs explicit consent: one detailed proposal.',
+    },
+    {
+        section: 'special',
+        full: 'Use advertised proposal review tools to prepare a dashboard batch for a signed-in human. Read Proposal review in the session workflow for exact fingerprints, status and feedback, linked replacements, and withdrawal. When batch tools are unavailable, share individual Review links.',
+        compact: 'When advertised, brain_proposal_review_request prepares human dashboard review. See full workflow.',
+        essential: 'When listed, brain_proposal_review_request prepares human review.',
     },
     {
         section: 'special',
@@ -813,7 +819,7 @@ export function buildBrainmcpPluginInstall(host) {
     };
 }
 export const AGENT_SKILL_NAME = 'using-brainmcp';
-export const AGENT_SKILL_DESCRIPTION = 'Use brain / brainmcp shared project memory: orient, pull context before work, follow Rules/Skills/Workflows, write durable learnings back as reviewable proposals, and save a Context Path only when asked for an explanation link.';
+export const AGENT_SKILL_DESCRIPTION = 'Use brain / brainmcp for shared project memory, durable proposals and human review batches. Orient, pull context before work, follow Rules/Skills/Workflows, and save a Context Path only when asked for an explanation link.';
 /** The skill's reference file: the full session workflow, the text brain://workflow/session serves. */
 export const AGENT_SKILL_REFERENCE_PATH = 'references/session-workflow.md';
 /**
@@ -837,7 +843,7 @@ export function buildAgentSkillMarkdown(options) {
         '',
         '# Using brainMCP',
         '',
-        'Use this skill when the user mentions brain, brainmcp, project memory, shared agent context, durable learnings, workspace overview, Context Path, explanation link, or asks you to save/check/update project knowledge.',
+        'Use this skill when the user mentions brain, brainmcp, project memory, shared agent context, durable learnings, workspace overview, proposal review, Context Path, explanation link, or asks you to save/check/update project knowledge.',
         '',
         'Brain is this project\'s shared, reviewable memory. The user\'s request comes first: Brain supplies the context for it and keeps what the work teaches.',
         '',
@@ -860,6 +866,9 @@ export function buildAgentSkillMarkdown(options) {
         '| Save one new fact, decision, or lesson | `brain_remember`, after searching for an existing Neuron |',
         '| Correct or extend an existing Neuron | `brain_amend`: read it first, replace a changed fact, append only new learning |',
         '| Add a Core, Skill, Workflow, Rule, sector change, link, or several changes at once | `brain_change_propose` |',
+        '| Prepare existing proposals for a human decision | `brain_proposal_review_request`, then share `reviewUrl` |',
+        '| Check batch outcomes or feedback | `brain_proposal_review_status` and proposal resources |',
+        '| Correct or withdraw your own pending proposal | Advertised `replacesProposalId` or `brain_proposal_withdraw`. Read Proposal review first. |',
         '| Run a due recurring task | `brain_workflow_due`, do the work, `brain_comment_create` with format "report", then `brain_workflow_record_run` |',
         '| Tell a person the result of a task | `brain_comment_create` (a comment is not memory) |',
         '| Save an explanation link the user asked for | `brain_context_path_create` |',
@@ -895,7 +904,7 @@ export function buildAgentSkillMarkdown(options) {
         '',
         '## Full rules',
         '',
-        `\`${AGENT_SKILL_REFERENCE_PATH}\` in this skill's folder holds the full text of every rule; the MCP resource \`${BRAIN_WORKFLOW_RESOURCE_URI}\` serves the same text. Read it before you bootstrap an empty workspace, propose Rules or account-library items, edit sectors, attach files, save a Context Path, or work with a parent workspace's shared context, and whenever a step above needs more detail.`,
+        `\`${AGENT_SKILL_REFERENCE_PATH}\` and the MCP resource \`${BRAIN_WORKFLOW_RESOURCE_URI}\` serve the same full rules. Read the relevant section before bootstrap, proposal batches, Rules or account-library writes, sector edits, file transfers, Context Paths, or parent workspace reads.`,
     ].join('\n');
 }
 /**
@@ -1199,7 +1208,7 @@ export const SERVER_INSTRUCTIONS_LEAD_MAX_CHARS = 247;
  */
 export function buildServerInstructions() {
     return [
-        'brain (brainmcp) is this project\'s shared, reviewable memory MCP. Start each session with brain_workspace_overview; its Rules, Skills, and Workflows are binding; read recommendedNextActions.',
+        'brain (brainmcp) is shared, reviewable project memory. Start with brain_workspace_overview. Rules, Skills and Workflows are binding. Read recommendedNextActions.',
         `Full text: ${BRAIN_WORKFLOW_RESOURCE_URI}.`,
         ...PROJECT_INSTRUCTION_OBLIGATIONS.map(({ essential }) => `- ${essential}`),
         '',
@@ -1223,7 +1232,7 @@ export function buildCanonicalWorkflowMarkdown(options) {
             '## Current task',
             task,
             '',
-            'Before working on it: call `brain_workspace_overview`, then use the default `brain_node_search` working set for this task. Use exact/broader reads only when the returned packet says they are needed. Resolve skills and due workflows when recommended.',
+            'Before starting the task, call `brain_workspace_overview`, then use the default `brain_node_search` working set. Follow the packet for exact or broader reads and resolve recommended skills. Surface due workflows and run them only with the user’s approval.',
             '',
         ]
         : [];
@@ -1249,6 +1258,15 @@ export function buildCanonicalWorkflowMarkdown(options) {
         '',
         '## Shared (parent) context',
         SHARED_CONTEXT_GUIDANCE,
+        '',
+        '## Proposal review',
+        '- **Check availability.** Use the tools and input fields advertised by the current connection. Batch preparation uses `changes:read` and `changes:write`. Status uses `changes:read` and can remain available while writes are paused. Use the proposal’s individual `dashboardPath` when batching or fingerprint reads are unavailable.',
+        '- **Read the current version.** Read the `proposalResourceUri` from the proposal result for its current `operationsFingerprint`, status, replacement link, redacted operations and permitted feedback. Creator access follows the submitting connection. Follow `operationsContinuation` and `feedbackContinuation` separately. For each section, follow `continuation.resourceUri` to the last page, join `jsonFragment` values in order, and parse the resulting JSON array. Restart at the proposal resource if the revision changes.',
+        '- **Prepare review.** Call `brain_proposal_review_request` with `workspaceId`, a fresh `idempotencyKey` and up to 100 pending or approved workspace graph proposals from this connection, including linked replacement rows. Each item needs `proposalId`, `expectedOperationsFingerprint` and a `suggestedAction` of `approve`, `apply`, `reject`, `request_changes` or `use_replacement`. Optional `rationale` text has a limit of 1,000 UTF-8 bytes per row and 32 KiB across the batch. For `use_replacement`, also send `replacementProposalId` and `expectedReplacementOperationsFingerprint`. Use individual dashboard links for workspace descriptions and account-library proposals. Report the accepted count, item errors and `omittedErrorCount`. Reread a changed proposal before preparing a new selection.',
+        '- **Hand off.** Share `reviewUrl`. If asked to open it, set `offerReviewUrl: true`. Supported hosts can show an optional URL prompt. Acknowledgement dismisses it. Resume with the same input and key to get the receipt. Decisions come from the signed-in dashboard reviewer.',
+        '- **Check outcomes.** When asked for progress, call `brain_proposal_review_status` with `batchId` and the batch’s `workspaceId`. Pass `nextCursor` back as `cursor`. Report row outcomes separately. Approval can precede application, a comment alone keeps a row open, and a request for changes asks for a revision. If `feedbackOmitted` is true, read `feedbackResourceUri` if supplied or open the row in Review.',
+        '- **Correct a proposal.** When advertised, send `replacesProposalId` in a new direct `brain_change_propose`, `brain_remember` or `brain_amend` submission for your own pending original in the same workspace. Use a fresh key. The linked replacement always waits for human review. Present the pair through `use_replacement` or its Review links.',
+        '- **Withdraw when authorized.** `brain_proposal_withdraw` uses `changes:write` and workspace proposal access. Withdraw your own tracked pending proposal before reviewer approval or edits. Send `workspaceId`, `proposalId`, `expectedOperationsFingerprint` and a fresh `idempotencyKey`. Include a short `reason` when useful. To link a replacement, create it first and pass its pending ID as `replacementProposalId`. An application hold blocks withdrawal. Report the receipt and Review link. Retry any unknown write outcome with the same input and key.',
         '',
         '## Side effects and limits',
         '- Review-required proposals wait for human approval; auto-apply still records full history.',

@@ -1,6 +1,6 @@
 # brainMCP for Claude Code
 
-Version 0.1.47 (guidance 2026.11.10). Shared, reviewable project memory for coding agents: Claude orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
+Version 0.1.48 (guidance 2026.11.19). Shared, reviewable project memory for coding agents: Claude orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
 
 ## Install
 
@@ -23,11 +23,11 @@ If your network blocks Dynamic Client Registration, add the server with the stat
 ## What is inside
 
 - `.mcp.json`: the `brain` server, shown as `plugin:brainmcp:brain`.
-- `skills/using-brainmcp` (how to use Brain) and `skills/setup` (sign-in, capture, diagnosis).
+- `skills/using-brainmcp` (how to use Brain, including the [Proposal review workflow](skills/using-brainmcp/references/session-workflow.md#proposal-review)) and `skills/setup` (sign-in, capture, diagnosis).
 - `hooks/hooks.json`: SessionStart, UserPromptSubmit, PostToolUse, PreCompact, and SessionEnd. Hooks inject context; they cannot force a tool call.
-- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.47, unmodified and unbundled.
+- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.48, unmodified and unbundled.
 
-A plugin cannot write CLAUDE.md, so every session start adds Brain's always-on guidance (guidance 2026.11.10, in compact form), signed in or not. It leaves that out when `~/.claude/CLAUDE.md` (under `CLAUDE_CONFIG_DIR` when that is set) or the CLAUDE.md at the project root already has the block `brainmcp init` writes for the same guidance version.
+A plugin cannot write CLAUDE.md, so every session start adds Brain's always-on guidance (guidance 2026.11.19, in compact form), signed in or not. It leaves that out when `~/.claude/CLAUDE.md` (under `CLAUDE_CONFIG_DIR` when that is set) or the CLAUDE.md at the project root already has the block `brainmcp init` writes for the same guidance version.
 
 If you also ran `brainmcp init` for Claude Code, rerun it: with the plugin enabled it removes its own MCP entry and hooks and keeps only its guidance, so Brain loads once.
 

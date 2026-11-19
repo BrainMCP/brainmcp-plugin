@@ -108,6 +108,7 @@ const READ_ONLY_TOOL_NAMES = new Set([
     'brain_graph_read',
     'brain_node_read',
     'brain_file_read',
+    'brain_proposal_review_status',
     'brain_node_search',
     'brain_context_handoff',
     'brain_tags_list',

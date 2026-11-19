@@ -1,6 +1,6 @@
 {
   "name": "@brainmcp/brainmcp",
-  "version": "0.1.47",
+  "version": "0.1.48",
   "description": "Safely configure BrainMCP guidance and MCP connections across agent projects",
   "type": "module",
   "bin": {

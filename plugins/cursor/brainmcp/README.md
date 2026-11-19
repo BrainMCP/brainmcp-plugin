@@ -1,6 +1,6 @@
 # brainMCP for Cursor
 
-Version 0.1.47 (guidance 2026.11.10). Shared, reviewable project memory for coding agents: Cursor agents orient from your Brain workspace before work and propose durable learnings back as reviewable changes.
+Version 0.1.48 (guidance 2026.11.19). Shared, reviewable project memory for coding agents: Cursor agents orient from your Brain workspace before work and propose durable learnings back as reviewable changes.
 
 ## Install
 
@@ -10,7 +10,7 @@ For most Cursor users the recommended setup is still `npx --yes @brainmcp/brainm
 
 - `mcp.json`: the `brain` server with Brain's public `cursor` OAuth client.
 - `rules/brainmcp-workspace.mdc`: an always-applied rule with the Brain workflow.
-- `skills/using-brainmcp`: how to use Brain.
+- `skills/using-brainmcp`: how to use Brain, including the [Proposal review workflow](skills/using-brainmcp/references/session-workflow.md#proposal-review).
 
 This plugin ships no hooks yet. `npx --yes @brainmcp/brainmcp@latest init --client cursor` adds session-start orientation and opt-in capture hooks, but it also writes its own MCP entry and rule, so use either the plugin or `init` for Cursor, not both; two `brain` entries compete for the same OAuth sign-in.
 

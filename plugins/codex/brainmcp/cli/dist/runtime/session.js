@@ -95,7 +95,7 @@ export function parseBrainToolResult(toolName, toolResult) {
                 note: 'Proposal created awaiting review',
             };
         }
-        if (status === 'rejected' || status === 'failed') {
+        if (status === 'rejected' || status === 'failed' || status === 'withdrawn' || status === 'superseded') {
             return { isWriteBack: false, status };
         }
         // Default if proposal created with an ID

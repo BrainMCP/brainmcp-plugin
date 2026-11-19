@@ -1,11 +1,11 @@
 ---
 name: using-brainmcp
-description: Use brain / brainmcp shared project memory: orient, pull context before work, follow Rules/Skills/Workflows, write durable learnings back as reviewable proposals, and save a Context Path only when asked for an explanation link.
+description: Use brain / brainmcp for shared project memory, durable proposals and human review batches. Orient, pull context before work, follow Rules/Skills/Workflows, and save a Context Path only when asked for an explanation link.
 ---
 
 # Using brainMCP
 
-Use this skill when the user mentions brain, brainmcp, project memory, shared agent context, durable learnings, workspace overview, Context Path, explanation link, or asks you to save/check/update project knowledge.
+Use this skill when the user mentions brain, brainmcp, project memory, shared agent context, durable learnings, workspace overview, proposal review, Context Path, explanation link, or asks you to save/check/update project knowledge.
 
 Brain is this project's shared, reviewable memory. The user's request comes first: Brain supplies the context for it and keeps what the work teaches.
 
@@ -26,6 +26,9 @@ Brain is this project's shared, reviewable memory. The user's request comes firs
 | Save one new fact, decision, or lesson | `brain_remember`, after searching for an existing Neuron |
 | Correct or extend an existing Neuron | `brain_amend`: read it first, replace a changed fact, append only new learning |
 | Add a Core, Skill, Workflow, Rule, sector change, link, or several changes at once | `brain_change_propose` |
+| Prepare existing proposals for a human decision | `brain_proposal_review_request`, then share `reviewUrl` |
+| Check batch outcomes or feedback | `brain_proposal_review_status` and proposal resources |
+| Correct or withdraw your own pending proposal | Advertised `replacesProposalId` or `brain_proposal_withdraw`. Read Proposal review first. |
 | Run a due recurring task | `brain_workflow_due`, do the work, `brain_comment_create` with format "report", then `brain_workflow_record_run` |
 | Tell a person the result of a task | `brain_comment_create` (a comment is not memory) |
 | Save an explanation link the user asked for | `brain_context_path_create` |
@@ -61,4 +64,4 @@ Brain is this project's shared, reviewable memory. The user's request comes firs
 
 ## Full rules
 
-`references/session-workflow.md` in this skill's folder holds the full text of every rule; the MCP resource `brain://workflow/session` serves the same text. Read it before you bootstrap an empty workspace, propose Rules or account-library items, edit sectors, attach files, save a Context Path, or work with a parent workspace's shared context, and whenever a step above needs more detail.
+`references/session-workflow.md` and the MCP resource `brain://workflow/session` serve the same full rules. Read the relevant section before bootstrap, proposal batches, Rules or account-library writes, sector edits, file transfers, Context Paths, or parent workspace reads.
