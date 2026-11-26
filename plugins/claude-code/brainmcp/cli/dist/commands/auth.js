@@ -2,12 +2,14 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { stdin } from 'node:process';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { BRAINMCP_CLI_CLIENT_ID, BRAINMCP_CLI_DEFAULT_SCOPES, } from '../agent-config.js';
 import { ApiClient } from '../lib/api-client.js';
 import { COMPANION_WORKSPACES_PATH } from '../lib/endpoints.js';
 import { startCallbackServer } from '../lib/callback-server.js';
 import { isWorkspaceUuid, normalizeWorkspaceId, } from '../lib/cli-contracts.js';
 import { createDefaultCredentialStore, MemoryCredentialStore } from '../lib/credentials.js';
+import { RequestDeadlineError } from '../lib/http.js';
 import { grantedCliScopes, OAuthClient } from '../lib/oauth-client.js';
 export { grantedCliScopes } from '../lib/oauth-client.js';
 import { generatePkce } from '../lib/pkce.js';
@@ -18,6 +20,31 @@ import { withSessionLock } from '../runtime/lock.js';
 import { checkRuntimeDrift } from '../runtime/doctor-checks.js';
 import { cliPackageVersion } from '../runtime/installer.js';
 const MAX_SERVICE_TOKEN_STDIN_BYTES = 64 * 1024;
+const LOGIN_WORKSPACES_TIMEOUT_MS = 3_000;
+const LOGIN_WORKSPACES_RETRY_TIMEOUT_MS = 7_000;
+const LOGIN_WORKSPACES_RETRY_MAX_DELAY_MS = 1_000;
+const LOGIN_WORKSPACES_RETRY_STATUSES = new Set([408, 500, 502, 503, 504]);
+async function listWorkspacesAfterOAuth(apiClient, accessToken) {
+    const request = (timeoutMs) => apiClient.request(COMPANION_WORKSPACES_PATH, {
+        timeoutMs,
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    try {
+        return await request(LOGIN_WORKSPACES_TIMEOUT_MS);
+    }
+    catch (error) {
+        const { status, retryAfterSeconds } = (error ?? {});
+        if (!(error instanceof RequestDeadlineError) && !LOGIN_WORKSPACES_RETRY_STATUSES.has(status ?? 0))
+            throw error;
+        // The workspace read is safe to retry with the issued token. Leave time
+        // for a cold API response without holding up interactive sign-in indefinitely.
+        const waitMs = Math.max(250, (retryAfterSeconds ?? 0) * 1_000);
+        if (waitMs > LOGIN_WORKSPACES_RETRY_MAX_DELAY_MS)
+            throw error;
+        await sleep(waitMs);
+        return request(LOGIN_WORKSPACES_RETRY_TIMEOUT_MS);
+    }
+}
 /**
  * The workspace allowlist and default to store for a companion login. The
  * default must be one of the listed workspaces: capture and orientation go
@@ -101,9 +128,9 @@ async function readStdinServiceToken() {
     }
     return Buffer.concat(chunks).toString('utf8').trim().split(/\r?\n/, 1)[0] ?? '';
 }
-export function resetCompanionLocalState(home) {
+export async function resetCompanionLocalState(home) {
     clearOrientCache(home);
-    disableCapture({ baseDir: home });
+    await disableCapture({ baseDir: home });
 }
 /**
  * Commit local identity only after the remote exchange has finished. Resolves
@@ -133,7 +160,7 @@ export async function commitCompanionCredentials(input) {
             if (input.home)
                 switchCurrentAccount(input.home, accountId);
             if (stateDir) {
-                resetCompanionLocalState(stateDir);
+                await resetCompanionLocalState(stateDir);
                 if (input.captureWorkspaceId)
                     enableCapture({ baseDir: stateDir, workspaceId: input.captureWorkspaceId });
             }
@@ -379,10 +406,7 @@ export async function login(options = {}) {
             };
             const home = companionRuntimeHome(options);
             const apiClient = options.apiClient ?? new ApiClient({ store, oauthClient });
-            const listed = await apiClient.request(COMPANION_WORKSPACES_PATH, {
-                timeoutMs: 3_000,
-                headers: { Authorization: `Bearer ${tokenResponse.access_token}` },
-            });
+            const listed = await listWorkspacesAfterOAuth(apiClient, tokenResponse.access_token);
             if (listed.account?.clientId !== BRAINMCP_CLI_CLIENT_ID) {
                 throw new Error('The issued OAuth token is not bound to the BrainMCP CLI client.');
             }
@@ -452,7 +476,7 @@ export async function logout(options = {}) {
         const finished = Boolean(await store.retryPendingClear?.());
         if (finished) {
             if (stateDir)
-                resetCompanionLocalState(stateDir);
+                await resetCompanionLocalState(stateDir);
             if (home && getCurrentAccountId(home) === accountId)
                 clearCurrentAccount(home);
         }
@@ -495,7 +519,7 @@ export async function logout(options = {}) {
         // the next `brainmcp logout` finds and retries the pending delete.
         await store.clear();
         if (stateDir)
-            resetCompanionLocalState(stateDir);
+            await resetCompanionLocalState(stateDir);
         if (home && getCurrentAccountId(home) === accountId)
             clearCurrentAccount(home);
         return true;
@@ -536,7 +560,13 @@ export async function whoami(options = {}) {
         }
         return unauth;
     }
-    const prefs = readPreferences(options.runtimeHome ?? process.env.BRAINMCP_HOME ?? process.env.BRAIN_HOME);
+    let prefs = null;
+    try {
+        prefs = readPreferences(options.runtimeHome ?? process.env.BRAINMCP_HOME ?? process.env.BRAIN_HOME);
+    }
+    catch {
+        prefs = null;
+    }
     const reauthRequired = creds.authType === 'oauth' && Boolean(creds.reauthRequired);
     const responseEnvelope = {
         status: reauthRequired ? 'reauth_required' : 'authenticated',

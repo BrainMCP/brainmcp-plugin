@@ -1,6 +1,6 @@
-import { readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { BRAINMCP_PLUGIN_NAME } from '../agent-config.js';
 export function isPluginHost(client) {
     return client === 'claude-code' || client === 'codex';
@@ -47,8 +47,38 @@ function readText(path) {
 function isBrainmcpPluginId(id) {
     return id.startsWith(`${BRAINMCP_PLUGIN_NAME}@`) && id.length > BRAINMCP_PLUGIN_NAME.length + 1;
 }
-function samePath(a, b) {
-    return Boolean(a && b) && resolve(a) === resolve(b);
+function canonicalPath(value) {
+    const resolved = resolve(value);
+    try {
+        return realpathSync(resolved);
+    }
+    catch {
+        return resolved;
+    }
+}
+/** Directories from `root` up to the nearest Git root (bounded at 16 levels). */
+function ancestorProjectDirs(root) {
+    const start = canonicalPath(root);
+    const dirs = [];
+    let current = start;
+    for (let depth = 0; depth < 16; depth += 1) {
+        dirs.push(current);
+        if (lstatSync(join(current, '.git'), { throwIfNoEntry: false }))
+            break;
+        const parent = dirname(current);
+        if (parent === current)
+            break;
+        current = parent;
+    }
+    return dirs;
+}
+function sameOrInsideProject(projectPath, lookupRoot) {
+    if (!projectPath || !lookupRoot)
+        return false;
+    const project = canonicalPath(projectPath);
+    const root = canonicalPath(lookupRoot);
+    const prefix = project.endsWith(sep) ? project : `${project}${sep}`;
+    return root === project || root.startsWith(prefix);
 }
 /** Claude Code's config directory: `CLAUDE_CONFIG_DIR`, else `~/.claude`. */
 export function claudeConfigDir(lookup = {}) {
@@ -73,9 +103,12 @@ export function detectClaudeCodePlugin(lookup = {}) {
     const plugins = installed?.plugins && typeof installed.plugins === 'object' && !Array.isArray(installed.plugins)
         ? installed.plugins
         : {};
+    const projectDirs = lookup.root ? ancestorProjectDirs(lookup.root) : [];
     const settings = [
-        lookup.root ? readJson(join(lookup.root, '.claude', 'settings.local.json')) : undefined,
-        lookup.root ? readJson(join(lookup.root, '.claude', 'settings.json')) : undefined,
+        ...projectDirs.flatMap((dir) => [
+            readJson(join(dir, '.claude', 'settings.local.json')),
+            readJson(join(dir, '.claude', 'settings.json')),
+        ]),
         readJson(join(configDir, 'settings.json')),
     ];
     const enabledFor = (pluginId) => {
@@ -98,7 +131,7 @@ export function detectClaudeCodePlugin(lookup = {}) {
                 continue;
             const { scope, projectPath, version } = record;
             const applies = scope === 'user' ||
-                ((scope === 'project' || scope === 'local') && typeof projectPath === 'string' && samePath(projectPath, lookup.root));
+                ((scope === 'project' || scope === 'local') && typeof projectPath === 'string' && sameOrInsideProject(projectPath, lookup.root));
             if (!applies)
                 continue;
             installs.push({
@@ -141,11 +174,12 @@ function parseCodexConfig(config) {
     let current;
     let currentHook;
     for (const line of config.split(/\r?\n/)) {
-        const header = line.match(/^\s*\[\s*plugins\s*\.\s*"([^"]+)"\s*\]\s*(?:#.*)?$/);
+        const header = line.match(/^\s*\[\s*plugins\s*\.\s*(?:"([^"]+)"|'([^']+)')\s*\]\s*(?:#.*)?$/);
         if (header) {
             currentHook = undefined;
-            current = isBrainmcpPluginId(header[1])
-                ? { pluginId: header[1], scope: 'user', enabled: true }
+            const pluginId = header[1] ?? header[2];
+            current = isBrainmcpPluginId(pluginId)
+                ? { pluginId, scope: 'user', enabled: true }
                 : undefined;
             if (current)
                 installs.push(current);
@@ -169,7 +203,7 @@ function parseCodexConfig(config) {
             current.enabled = enabled[1] === 'true';
         if (currentHook && enabled)
             currentHook.disabled = enabled[1] === 'false';
-        if (currentHook && /^\s*trusted_hash\s*=\s*"[^"]+"/.test(line))
+        if (currentHook && /^\s*trusted_hash\s*=\s*(?:"[^"]+"|'[^']+')/.test(line))
             currentHook.trusted = true;
     }
     return { installs, hookStates };
@@ -193,11 +227,18 @@ export function detectCodexPlugin(lookup = {}) {
     const codexHome = codexHomeDir(lookup);
     const { installs, hookStates } = parseCodexConfig(readText(join(codexHome, 'config.toml')) ?? '');
     for (const install of installs) {
-        const [name, marketplace] = install.pluginId.split('@');
-        const cacheDir = join(codexHome, 'plugins', 'cache', marketplace, name);
-        install.version = installedCodexVersion(cacheDir);
-        const shipped = install.version ? codexHookHandlers(readJson(join(cacheDir, install.version, 'hooks', 'hooks.json'))) : undefined;
-        install.trustedHookEvents = trustedCodexHookEvents(install.pluginId, hookStates, shipped);
+        const parts = install.pluginId.split('@');
+        const [name, marketplace] = parts.length === 2 ? parts : [undefined, undefined];
+        const safeSegment = (value) => Boolean(value && value !== '.' && value !== '..' && !/[/\\]/.test(value));
+        if (safeSegment(name) && safeSegment(marketplace)) {
+            const cacheDir = join(codexHome, 'plugins', 'cache', marketplace, name);
+            install.version = installedCodexVersion(cacheDir);
+            const shipped = install.version ? codexHookHandlers(readJson(join(cacheDir, install.version, 'hooks', 'hooks.json'))) : undefined;
+            install.trustedHookEvents = trustedCodexHookEvents(install.pluginId, hookStates, shipped);
+        }
+        else {
+            install.trustedHookEvents = trustedCodexHookEvents(install.pluginId, hookStates, undefined);
+        }
     }
     return { host: 'codex', installs, active: installs.find((install) => install.enabled) };
 }

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { withSessionLock } from '../runtime/lock.js';
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { assertNotSymlink, ensureDirectory0700, getBrainHome, getCurrentAccountId, readSafeJson, resolveStateDir, writeAtomic0600 } from '../runtime/storage.js';
 import { createPlatformVault, UnavailableSecretVault, vaultAccountKey, LEGACY_VAULT_ACCOUNT, MACOS_SECURITY_MAX_LINE_BYTES, macosSecurityAddLine, VaultValueTooLargeError, } from './vault.js';
@@ -80,12 +80,65 @@ export function validateStoredCredentials(data) {
 export function parseStoredCredentials(raw) {
     return validateStoredCredentials(parseJsonWithoutEcho(raw, 'credentials'));
 }
+export class UnsafeCredentialPathError extends Error {
+}
+function assertSafeCredentialFile(filePath, stat) {
+    if (stat.isSymbolicLink()) {
+        throw new UnsafeCredentialPathError(`Insecure configuration: file ${filePath} is a symbolic link.`);
+    }
+    if (!stat.isFile()) {
+        throw new UnsafeCredentialPathError(`Insecure configuration: ${filePath} is not a regular file.`);
+    }
+    if (process.platform !== 'win32') {
+        const mode = stat.mode & 0o777;
+        if (mode !== 0o600) {
+            throw new UnsafeCredentialPathError(`Insecure permissions on ${filePath}: permissions are ${mode.toString(8)}, must be 600.`);
+        }
+        if (process.getuid && stat.uid !== process.getuid()) {
+            throw new UnsafeCredentialPathError(`Insecure ownership: file ${filePath} is not owned by current user.`);
+        }
+    }
+}
+function assertSafeCredentialPath(filePath) {
+    const dir = dirname(filePath);
+    const dirStat = lstatSync(dir, { throwIfNoEntry: false });
+    if (dirStat) {
+        if (dirStat.isSymbolicLink()) {
+            throw new UnsafeCredentialPathError(`Insecure configuration: directory ${dir} is a symbolic link.`);
+        }
+        if (process.platform !== 'win32') {
+            const mode = dirStat.mode & 0o777;
+            if (mode !== 0o700) {
+                throw new UnsafeCredentialPathError(`Insecure permissions on ${dir}: permissions are ${mode.toString(8)}, must be 700.`);
+            }
+            if (process.getuid && dirStat.uid !== process.getuid()) {
+                throw new UnsafeCredentialPathError(`Insecure ownership: directory ${dir} is not owned by current user.`);
+            }
+        }
+    }
+    const stat = lstatSync(filePath, { throwIfNoEntry: false });
+    if (stat)
+        assertSafeCredentialFile(filePath, stat);
+}
+/** Read a file credential through the same path and descriptor checks as the store. */
+export function readCredentialFile(filePath) {
+    assertSafeCredentialPath(filePath);
+    const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    try {
+        assertSafeCredentialFile(filePath, fstatSync(fd));
+        return readFileSync(fd, 'utf8');
+    }
+    finally {
+        closeSync(fd);
+    }
+}
 /**
  * A printable reason a credentials document could not be used. Only messages
  * this module wrote (or a filesystem error code) are shown, never record text.
  */
 export function describeCredentialsError(error) {
-    if (error instanceof InvalidJsonError || error instanceof InvalidCredentialsError)
+    if (error instanceof InvalidJsonError || error instanceof InvalidCredentialsError ||
+        error instanceof UnsafeCredentialPathError)
         return error.message;
     const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
     return typeof code === 'string' ? `could not be read (${code})` : 'could not be read';
@@ -143,48 +196,9 @@ export class FileCredentialStore {
             lockPath: join(stateDir, 'credentials.lock'),
         };
     }
-    assertSafePath(targetPath, checkFileExists = true) {
-        if (this.allowInsecure)
-            return;
-        // Check directory
-        const dir = dirname(targetPath);
-        if (existsSync(dir)) {
-            const dirStat = lstatSync(dir);
-            if (dirStat.isSymbolicLink()) {
-                throw new Error(`Insecure configuration: directory ${dir} is a symbolic link.`);
-            }
-            if (process.platform !== 'win32') {
-                const mode = dirStat.mode & 0o777;
-                if (mode !== 0o700) {
-                    throw new Error(`Insecure permissions on ${dir}: permissions are ${mode.toString(8)}, must be 700.`);
-                }
-                if (process.getuid && dirStat.uid !== process.getuid()) {
-                    throw new Error(`Insecure ownership: directory ${dir} is not owned by current user.`);
-                }
-            }
-        }
-        // Check target file if it exists
-        if (existsSync(targetPath)) {
-            const fileStat = lstatSync(targetPath);
-            if (fileStat.isSymbolicLink()) {
-                throw new Error(`Insecure configuration: file ${targetPath} is a symbolic link.`);
-            }
-            if (!fileStat.isFile()) {
-                throw new Error(`Insecure configuration: ${targetPath} is not a regular file.`);
-            }
-            if (process.platform !== 'win32') {
-                const mode = fileStat.mode & 0o777;
-                if (mode !== 0o600) {
-                    throw new Error(`Insecure permissions on ${targetPath}: permissions are ${mode.toString(8)}, must be 600.`);
-                }
-                if (process.getuid && fileStat.uid !== process.getuid()) {
-                    throw new Error(`Insecure ownership: file ${targetPath} is not owned by current user.`);
-                }
-            }
-        }
-        else if (checkFileExists) {
-            // File doesn't exist yet, which is fine
-        }
+    assertSafePath(targetPath) {
+        if (!this.allowInsecure)
+            assertSafeCredentialPath(targetPath);
     }
     ensureDirectory() {
         if (!existsSync(this.baseDir)) {
@@ -198,17 +212,16 @@ export class FileCredentialStore {
         }
         const paths = this.credentialPaths();
         ensureDirectory0700(paths.stateDir);
-        this.assertSafePath(paths.filePath, false);
+        this.assertSafePath(paths.filePath);
         return paths;
     }
     async get() {
         const { filePath } = this.credentialPaths();
-        if (!existsSync(filePath)) {
+        if (!lstatSync(filePath, { throwIfNoEntry: false })) {
             return null;
         }
-        this.assertSafePath(filePath);
         try {
-            const raw = readFileSync(filePath, 'utf-8');
+            const raw = this.allowInsecure ? readFileSync(filePath, 'utf8') : readCredentialFile(filePath);
             // Version-only check, as before: doctor applies the full validateStoredCredentials.
             const parsed = parseJsonWithoutEcho(raw, 'credentials file');
             if (parsed?.version !== CREDENTIALS_SCHEMA_VERSION) {
@@ -219,6 +232,8 @@ export class FileCredentialStore {
             return parsed;
         }
         catch (error) {
+            if (error instanceof UnsafeCredentialPathError)
+                throw error;
             this.warn(`Failed to read credentials: ${describeCredentialsError(error)}`);
             return null;
         }

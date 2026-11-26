@@ -9,7 +9,7 @@ const SENSITIVE_KEY_PATTERNS = [
     /cookie/i,
     /password/i,
     /verifier/i,
-    /code/i,
+    /^(?:(?:auth(?:orization)?|oauth|pkce|exchange|redirect|callback)[_-]?)?code$/i,
     /prompt/i,
     /assistant/i,
     /content/i,
@@ -56,8 +56,8 @@ export function logRuntimeEvent(level, event, metadata, baseDir) {
         const logsDir = getLogsDir(baseDir);
         const logFile = path.join(logsDir, 'runtime.log');
         assertNotSymlink(logFile);
-        if (fs.existsSync(logFile) && fs.lstatSync(logFile).size >= 5 * 1024 * 1024) {
-            // Bound diagnostics even when capture is disabled and no ledger is pruned.
+        if (fs.existsSync(logFile) && fs.lstatSync(logFile).size >= 6 * 1024 * 1024) {
+            // Backstop cap above retention's 5 MiB tail-preserving rotation, even when capture is disabled.
             fs.truncateSync(logFile, 0);
         }
         const entry = {

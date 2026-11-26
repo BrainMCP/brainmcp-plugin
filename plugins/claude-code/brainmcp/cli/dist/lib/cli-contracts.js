@@ -283,13 +283,18 @@ export function parseJsonWithoutEcho(raw, subject) {
  */
 export function filterRelativePaths(paths, rootDir) {
     const normalizedRoot = path.posix.normalize(rootDir.replace(/\\/g, '/')).replace(/\/+$/, '');
+    const rootPrefix = normalizedRoot + '/';
+    const windowsRoot = /^[a-zA-Z]:\//.test(rootPrefix);
     const out = [];
     for (const raw of paths) {
         let p = path.posix.normalize(raw.replace(/\\/g, '/'));
         if (p.startsWith('/') || /^[a-zA-Z]:\//.test(p)) {
-            if (!p.startsWith(normalizedRoot + '/'))
+            const matchesRoot = windowsRoot
+                ? p.slice(0, rootPrefix.length).toLowerCase() === rootPrefix.toLowerCase()
+                : p.startsWith(rootPrefix);
+            if (!matchesRoot)
                 continue;
-            p = p.slice(normalizedRoot.length + 1);
+            p = p.slice(rootPrefix.length);
         }
         if (p === '.' || p.split('/').includes('..'))
             continue;

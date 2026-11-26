@@ -173,7 +173,9 @@ export async function apiFetch(input, options = {}) {
         throw new ApiNetworkError(error);
     }
     if (!response.ok) {
-        throw new ApiClientError(response, await response.clone().text());
+        // Read the body itself: a clone tees the stream and leaves the original
+        // unread, which on Workers holds the subrequest's connection open.
+        throw new ApiClientError(response, await response.text());
     }
     return response;
 }

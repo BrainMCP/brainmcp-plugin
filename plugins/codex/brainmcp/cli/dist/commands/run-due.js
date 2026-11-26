@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildRunDuePrompt } from '../agent-config.js';
@@ -23,9 +24,18 @@ export const RUN_DUE_DEFAULT_TIMEOUT_MINUTES = 30;
 export const RUN_DUE_MAX_TIMEOUT_MINUTES = 24 * 60;
 /** How long a stopped agent gets to exit before it is killed. */
 const AGENT_STOP_GRACE_MS = 10_000;
+/** How long after the kill the run stops waiting for a process group that will not go. */
+const AGENT_SETTLE_GIVE_UP_MS = 2_000;
 /** `/orient` takes seconds on a cold start, and nothing here races a hook's budget. */
 const DUE_READ_TIMEOUT_MS = 30_000;
 const STALE_UNREADABLE_LOCK_MS = 5_000;
+/**
+ * How long past the agent's deadline a run can still hold its lock: the stop grace, the wait after
+ * the kill, and the due-work read that checks the result, plus slack. Only a run whose machine slept
+ * mid-run outlives it; the owner token keeps that run from removing the lock of the run that took over.
+ */
+const RUN_DUE_LOCK_SLACK_MS = AGENT_STOP_GRACE_MS + AGENT_SETTLE_GIVE_UP_MS + DUE_READ_TIMEOUT_MS + 30_000;
+const LOCK_RELEASE_GUARD_WAIT_MS = 100;
 function signInRequired(message) {
     return Object.assign(new Error(message), { status: 401 });
 }
@@ -111,11 +121,21 @@ export function acquireRunDueLock(workspaceId, timeoutMs, baseDir) {
             return Date.now() - mtimeMs > STALE_UNREADABLE_LOCK_MS;
         }
     };
+    const owner = randomUUID();
+    const isOwn = (text) => {
+        try {
+            return JSON.parse(text)?.owner === owner;
+        }
+        catch {
+            return false;
+        }
+    };
     for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
-            const expiresAt = Date.now() + timeoutMs + 2 * AGENT_STOP_GRACE_MS;
-            fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, expiresAt }), { flag: 'wx', mode: 0o600 });
-            return () => fs.rmSync(lockPath, { force: true });
+            const expiresAt = Date.now() + timeoutMs + RUN_DUE_LOCK_SLACK_MS;
+            fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, expiresAt, owner }), { flag: 'wx', mode: 0o600 });
+            // A run that overran its lock finds another run's lock here, and leaves it.
+            return () => void removeLockIfStill(lockPath, isOwn, LOCK_RELEASE_GUARD_WAIT_MS);
         }
         catch (error) {
             if (error.code !== 'EEXIST')
@@ -168,7 +188,7 @@ export function runAgent(input) {
                 return error.code === 'EPERM';
             }
         };
-        let timedOut = false;
+        let interruption;
         let agentExited = false;
         let stoppedAt;
         let killTimer;
@@ -181,19 +201,23 @@ export function runAgent(input) {
         // only an agent still running at it makes the run a timeout.
         const timer = setTimeout(() => {
             if (!agentExited)
-                timedOut = true;
+                interruption ??= { kind: 'timed_out' };
             stop();
         }, input.timeoutMs);
-        // A cancelled CI job or Ctrl-C ends the agent too, and this process still releases its lock.
+        // A host signal can stop an agent that handles termination and then exits 0.
+        const cancel = (signal) => {
+            interruption ??= { kind: 'cancelled', signal };
+            stop();
+        };
         const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
         for (const signal of signals)
-            process.on(signal, stop);
+            process.on(signal, cancel);
         const finish = (outcome) => {
             clearTimeout(timer);
             clearTimeout(killTimer);
             for (const signal of signals)
-                process.off(signal, stop);
-            resolve(outcome);
+                process.off(signal, cancel);
+            resolve(interruption ?? outcome);
         };
         child.once('error', (error) => finish({ kind: 'not_started', message: error.message }));
         // `close` can wait for a helper holding an inherited pipe; the agent itself is done at `exit`.
@@ -207,11 +231,11 @@ export function runAgent(input) {
             const linger = setTimeout(() => { if (groupAlive())
                 stop(); }, input.lingerMs ?? AGENT_LINGER_MS);
             const settle = () => {
-                const giveUp = stoppedAt !== undefined && Date.now() >= stoppedAt + AGENT_STOP_GRACE_MS + 2_000;
+                const giveUp = stoppedAt !== undefined && Date.now() >= stoppedAt + AGENT_STOP_GRACE_MS + AGENT_SETTLE_GIVE_UP_MS;
                 if (groupAlive() && !giveUp)
                     return void setTimeout(settle, 250);
                 clearTimeout(linger);
-                finish(timedOut ? { kind: 'timed_out' } : { kind: 'exited', code, signal });
+                finish({ kind: 'exited', code, signal });
             };
             settle();
         });
@@ -272,6 +296,15 @@ export async function runDue(options) {
         const outcome = await runAgent({ agentCommand: options.agentCommand, prompt, cwd: options.cwd, timeoutMs, json: options.json });
         if (outcome.kind === 'not_started') {
             throw new CliConfigurationError(`Could not start the agent command "${options.agentCommand[0]}": ${outcome.message}`);
+        }
+        if (outcome.kind === 'cancelled') {
+            return report(options, {
+                status: 'cancelled',
+                workspaceId,
+                before,
+                cancellationSignal: outcome.signal,
+                message: `The run was cancelled (${outcome.signal}). Work already recorded stays done.`,
+            }, CLI_EXIT_CODES.GENERAL_ERROR);
         }
         if (outcome.kind === 'timed_out') {
             return report(options, {

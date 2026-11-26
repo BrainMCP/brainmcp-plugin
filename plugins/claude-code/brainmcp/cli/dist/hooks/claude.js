@@ -1,18 +1,22 @@
+function asString(value) {
+    return typeof value === 'string' ? value : undefined;
+}
 export function parseClaudeEvent(raw, eventName = 'SessionStart') {
-    const input = (raw && typeof raw === 'object' ? raw : {});
+    const input = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {});
+    const sessionId = asString(input.session_id);
     return {
         client: 'claude-code',
         event: eventName,
-        sessionKey: input.session_id || 'default_session',
-        cwd: input.cwd,
-        source: input.source,
-        transcriptPath: typeof input.transcript_path === 'string' ? input.transcript_path : undefined,
-        prompt: input.prompt,
-        toolName: input.tool_name,
+        sessionKey: sessionId && sessionId.length > 0 ? sessionId : 'default_session',
+        cwd: asString(input.cwd),
+        source: asString(input.source),
+        transcriptPath: asString(input.transcript_path),
+        prompt: asString(input.prompt),
+        toolName: asString(input.tool_name),
         toolInput: input.tool_input,
         toolResult: input.tool_response ?? input.tool_result,
-        stopHookActive: Boolean(input.stop_hook_active),
-        model: input.model,
+        stopHookActive: input.stop_hook_active === true,
+        model: asString(input.model),
     };
 }
 export function emitClaudeOutput(event, additionalContext) {

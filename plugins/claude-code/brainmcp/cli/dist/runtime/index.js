@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readBoundedStdin, dispatchHookEvent, hookDispatchMaxTimeoutMs, hookDispatchTimeoutMs } from './hook-dispatcher.js';
+import { readBoundedStdin, dispatchHookEvent, hookDispatchMaxTimeoutMs, hookDispatchTimeoutMs, pluginSessionStartFailureOutput } from './hook-dispatcher.js';
 import { parseHostEvent } from '../hooks/adapters.js';
-import { withRequestDeadline } from '../lib/http.js';
+import { RequestDeadlineError, withRequestDeadline } from '../lib/http.js';
+import { isPluginHost } from '../lib/host-plugins.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { BACKGROUND_FLUSH_ARG, runBackgroundFlushCli, startBackgroundCaptureFlush } from './background-flush.js';
 export * from './storage.js';
@@ -72,47 +73,62 @@ export async function runHookRuntimeCli(args = process.argv.slice(2)) {
     // The detached process runs this same bundle.
     const runtimePath = fileURLToPath(import.meta.url);
     const budget = hookRuntimeBudget(args);
+    const fromPlugin = args.includes(FROM_PLUGIN_ARG);
+    let normalizedEvent;
+    let output = {};
     try {
-        await withRequestDeadline(budget.deadlineMs, undefined, async (signal) => {
+        output = await withRequestDeadline(budget.deadlineMs, undefined, async (signal) => {
             const rawInput = await readBoundedStdin(process.stdin, undefined, signal);
-            if (!rawInput.trim()) {
-                process.stdout.write('{}\n');
-                process.exitCode = 0;
-                return;
-            }
+            if (!rawInput.trim())
+                return {};
             let parsed;
             try {
                 parsed = JSON.parse(rawInput);
             }
             catch {
-                process.stdout.write('{}\n');
-                process.exitCode = 0;
-                return;
+                return {};
             }
-            const host = String(args[0] || parsed.client || 'claude-code');
-            const eventName = String(args[1] || parsed.event || parsed.hook_event_name || 'GenericEvent');
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
                 throw new Error('Invalid hook input');
-            const normalizedEvent = parseHostEvent(host, parsed, eventName);
+            const host = String(args[0] || parsed.client || 'claude-code');
+            const eventName = String(args[1] || parsed.event || parsed.hook_event_name || 'GenericEvent');
+            normalizedEvent = parseHostEvent(host, parsed, eventName);
             normalizedEvent.nudgeLedger = args.includes('--nudge-ledger');
-            normalizedEvent.fromPlugin = args.includes(FROM_PLUGIN_ARG);
+            normalizedEvent.fromPlugin = fromPlugin;
             const res = await dispatchHookEvent(normalizedEvent, {
                 signal,
                 timeoutMs: budget.timeoutMs,
                 maxTimeoutMs: budget.maxTimeoutMs,
-                loginCommand: normalizedEvent.fromPlugin ? pluginLoginCommand(runtimePath) : undefined,
+                loginCommand: fromPlugin ? pluginLoginCommand(runtimePath) : undefined,
                 startBackgroundFlush: ({ baseDir }) => startBackgroundCaptureFlush({ runtimePath, baseDir }),
             });
+            if (res.outputPayload && Object.keys(res.outputPayload).length > 0) {
+                return res.outputPayload;
+            }
             signal.throwIfAborted();
-            process.stdout.write(JSON.stringify(res.outputPayload ?? {}) + '\n');
-            process.exitCode = 0;
+            return res.outputPayload ?? {};
         });
     }
-    catch {
+    catch (error) {
         logRuntimeEvent('warn', 'hook_input_or_deadline_failed');
-        process.stdout.write('{}\n');
-        process.exitCode = 0;
+        const host = normalizedEvent?.client ?? args[0];
+        const eventName = normalizedEvent?.event ?? args[1];
+        if (error instanceof RequestDeadlineError && fromPlugin && host && isPluginHost(host) && eventName === 'SessionStart') {
+            // The plugin's argv identifies SessionStart even if stdin never finished.
+            let cwd;
+            try {
+                cwd = process.cwd();
+            }
+            catch {
+                cwd = undefined;
+            }
+            const event = normalizedEvent ?? parseHostEvent(host, cwd ? { cwd } : {}, eventName);
+            event.fromPlugin = true;
+            output = pluginSessionStartFailureOutput(event, 'timeout');
+        }
     }
+    process.stdout.write(JSON.stringify(output) + '\n');
+    process.exitCode = 0;
 }
 function isMainModule() {
     const entry = process.argv[1];

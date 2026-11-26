@@ -9,6 +9,23 @@ const EXEC_TIMEOUT_MS = 4_000;
 const MACOS_ITEM_NOT_FOUND_EXIT = 44;
 /** ERROR_NOT_FOUND (0x80070490) as PowerShell's signed HResult. */
 const WINDOWS_NOT_FOUND_HRESULT = -2147023728;
+/**
+ * Opens the vault as `$v` at the start of every Windows script, or exits WINDOWS_VAULT_UNAVAILABLE_EXIT.
+ * Windows PowerShell 5.1 finds a WinRT class only after its type is loaded by this assembly-qualified
+ * name: without it, `New-Object Windows.Security.Credentials.PasswordVault` fails with "Cannot find
+ * type". PowerShell 7 has no WinRT, so the scripts run under powershell.exe. A machine without the
+ * Credential Locker, or a PowerShell held in Constrained Language Mode, still cannot load it.
+ */
+export const WINDOWS_OPEN_VAULT = "$ErrorActionPreference = 'Stop'; try { " +
+    '[void][Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]; ' +
+    '[void][Windows.Security.Credentials.PasswordCredential,Windows.Security.Credentials,ContentType=WindowsRuntime]; ' +
+    '$v = New-Object Windows.Security.Credentials.PasswordVault } catch { exit 3 }; ';
+/** How a Windows vault script reports that PowerShell cannot load the vault at all. */
+export const WINDOWS_VAULT_UNAVAILABLE_EXIT = 3;
+export const WINDOWS_VAULT_UNAVAILABLE_MESSAGE = 'Windows PowerShell cannot load the Windows credential vault (no Credential Locker, or Constrained Language Mode). ' +
+    'Run `brainmcp login --allow-file-credentials` to use the owner-only file store instead.';
+/** The most stderr a failed Windows store keeps: enough for the HRESULT line it prints. */
+const WINDOWS_STDERR_LIMIT = 1024;
 export function vaultAccountKey(accountId) {
     return `oauth:${accountId}`;
 }
@@ -221,18 +238,24 @@ export class WindowsCredentialVault {
         this.runCommand = runCommand;
     }
     name = 'windows-credential-manager';
+    /**
+     * Any Windows machine. Whether PowerShell can load the vault is learned from the scripts themselves
+     * (WINDOWS_VAULT_UNAVAILABLE_EXIT): a separate check would start PowerShell once more in every
+     * hook, whose budget each start already strains.
+     */
     async isAvailable() {
         return process.platform === 'win32';
     }
     async getSecret(key = VAULT_ACCOUNT) {
         assertVaultKey(key);
         try {
-            const { stdout } = await execFileAsync('powershell.exe', [
+            const result = await this.runCommand('powershell.exe', [
                 '-NoProfile',
+                '-NonInteractive',
                 '-Command',
-                `try { $v = New-Object Windows.Security.Credentials.PasswordVault; ($v.Retrieve('${VAULT_SERVICE}','${key}')).Password } catch { '' }`,
+                `${WINDOWS_OPEN_VAULT}try { ($v.Retrieve('${VAULT_SERVICE}','${key}')).Password } catch { '' }`,
             ], { timeout: EXEC_TIMEOUT_MS });
-            const value = stdout.trim();
+            const value = String(result?.stdout ?? '').trim();
             return value.length > 0 ? value : null;
         }
         catch {
@@ -244,9 +267,17 @@ export class WindowsCredentialVault {
         await new Promise((resolve, reject) => {
             const child = this.spawnProcess('powershell.exe', [
                 '-NoProfile',
+                '-NonInteractive',
                 '-Command',
-                `$svc='${VAULT_SERVICE}'; $acct='${key}'; $p=[Console]::In.ReadToEnd(); $v=New-Object Windows.Security.Credentials.PasswordVault; try { $v.Remove($v.Retrieve($svc,$acct)) } catch {}; $v.Add((New-Object Windows.Security.Credentials.PasswordCredential($svc,$acct,$p)))`,
-            ], { stdio: ['pipe', 'ignore', 'ignore'] });
+                // The secret arrives on stdin, never in the command line, and is read first so the pipe is
+                // drained whatever happens next. A failure prints only its HRESULTs.
+                `$p = [Console]::In.ReadToEnd(); ${WINDOWS_OPEN_VAULT}try { $svc='${VAULT_SERVICE}'; $acct='${key}'; try { $v.Remove($v.Retrieve($svc,$acct)) } catch {}; $v.Add((New-Object Windows.Security.Credentials.PasswordCredential($svc,$acct,$p))) } catch { [Console]::Error.WriteLine('HRESULT ' + $_.Exception.HResult + ' ' + $_.Exception.InnerException.HResult); exit 1 }`,
+            ], { stdio: ['pipe', 'ignore', 'pipe'] });
+            let stderr = '';
+            child.stderr?.on('data', (chunk) => {
+                if (stderr.length < WINDOWS_STDERR_LIMIT)
+                    stderr = `${stderr}${String(chunk)}`.slice(0, WINDOWS_STDERR_LIMIT);
+            });
             const timer = setTimeout(() => {
                 child.kill('SIGKILL');
                 reject(new Error('Windows PasswordVault store timed out'));
@@ -260,8 +291,10 @@ export class WindowsCredentialVault {
             child.on('close', (code) => {
                 if (code === 0)
                     done(() => resolve());
+                else if (code === WINDOWS_VAULT_UNAVAILABLE_EXIT)
+                    done(() => reject(new Error(WINDOWS_VAULT_UNAVAILABLE_MESSAGE)));
                 else
-                    done(() => reject(new Error('Windows PasswordVault store failed')));
+                    done(() => reject(new Error(`Windows PasswordVault store failed${windowsFailureDetail(stderr)}`)));
             });
             child.stdin.write(value);
             child.stdin.end();
@@ -273,12 +306,24 @@ export class WindowsCredentialVault {
         // the COM exception, so the inner one is checked too.
         await this.runCommand('powershell.exe', [
             '-NoProfile',
+            '-NonInteractive',
             '-Command',
-            `$v = New-Object Windows.Security.Credentials.PasswordVault; try { $c = $v.Retrieve('${VAULT_SERVICE}','${key}') } catch { if (@($_.Exception.HResult, $_.Exception.InnerException.HResult) -contains ${WINDOWS_NOT_FOUND_HRESULT}) { exit 0 }; exit 1 }; try { $v.Remove($c) } catch { exit 1 }`,
+            `${WINDOWS_OPEN_VAULT}try { $c = $v.Retrieve('${VAULT_SERVICE}','${key}') } catch { if (@($_.Exception.HResult, $_.Exception.InnerException.HResult) -contains ${WINDOWS_NOT_FOUND_HRESULT}) { exit 0 }; exit 1 }; try { $v.Remove($c) } catch { exit 1 }`,
         ], { timeout: EXEC_TIMEOUT_MS }).catch(() => {
             throw new Error('Windows PasswordVault delete failed');
         });
     }
+}
+/**
+ * The HRESULTs a failed Windows store printed, as hex, so a report names the cause. Nothing else from
+ * stderr is repeated: PowerShell echoes script text there.
+ */
+export function windowsFailureDetail(stderr) {
+    const codes = /HRESULT (-?\d+)(?: (-?\d+))?/.exec(stderr)?.slice(1).filter((code) => code !== undefined && code !== '');
+    if (!codes?.length)
+        return '';
+    const hex = [...new Set(codes)].map((code) => `0x${(Number(code) >>> 0).toString(16).toUpperCase().padStart(8, '0')}`);
+    return ` (HRESULT ${hex.join(', ')})`;
 }
 export function createPlatformVault() {
     if (process.platform === 'darwin')

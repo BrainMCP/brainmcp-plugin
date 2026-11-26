@@ -111,10 +111,17 @@ export function nextAutomaticDeliveryAt(baseDir, now = Date.now()) {
  * no other run holds the lease. Local work only: the hook never waits on the
  * network. Returns whether a process was started.
  */
+/**
+ * Whether at least one waiting automatic queue item is eligible to be started
+ * within a background flusher run's deadline right now.
+ */
+export function hasEligibleAutomaticDelivery(baseDir, now = Date.now()) {
+    const dueAt = nextAutomaticDeliveryAt(baseDir, now);
+    return dueAt !== null && dueAt - now <= BACKGROUND_FLUSH_DEADLINE_MS - BACKGROUND_FLUSH_REQUEST_TIMEOUT_MS;
+}
 export async function startBackgroundCaptureFlush(options) {
     const now = options.now ?? Date.now();
-    const dueAt = nextAutomaticDeliveryAt(options.baseDir, now);
-    if (dueAt === null || dueAt - now > BACKGROUND_FLUSH_DEADLINE_MS - BACKGROUND_FLUSH_REQUEST_TIMEOUT_MS)
+    if (!hasEligibleAutomaticDelivery(options.baseDir, now))
         return false;
     const owner = randomUUID();
     if (!(await claimFlusherLease(options.baseDir, owner, undefined, now)))
@@ -214,17 +221,16 @@ export async function runBackgroundCaptureFlush(options) {
                 await sleep(QUEUE_BUSY_RETRY_MS, controller.signal);
                 continue;
             }
-            // A pass that sent something re-checks at once; failures it recorded carry their own backoff.
-            if (pass.requests > 0)
-                continue;
             const now = Date.now();
             const dueAt = nextAutomaticDeliveryAt(stateDir, now);
             if (dueAt === null) {
                 summary.stopReason = 'idle';
                 break;
             }
-            // Due now yet not sent: consent, the grant, or its workspaces rule it out for this run.
             if (dueAt <= now) {
+                // Items remain due now: continue immediately if this pass made progress, otherwise stop.
+                if (pass.requests > 0)
+                    continue;
                 summary.stopReason = 'undeliverable';
                 break;
             }

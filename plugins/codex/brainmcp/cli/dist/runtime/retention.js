@@ -86,6 +86,8 @@ export function pruneLocalState(options) {
         // Listing creates the directory, and this also runs for a home that never turned capture on.
         const items = fs.existsSync(path.join(baseDir, 'queue')) ? listQueueItems(baseDir) : [];
         for (const item of items) {
+            if (item.status === 'sending' && item.deliveryLease && Date.parse(item.deliveryLease.expiresAt) > now)
+                continue;
             const createdAtMs = new Date(item.createdAt).getTime();
             if (now - createdAtMs > maxQueueAge || item.status === 'delivered') {
                 if (removeQueueItem(item.digestId, baseDir)) {
@@ -168,8 +170,8 @@ export function pruneLocalState(options) {
             const lockFiles = fs.readdirSync(locksDir);
             for (const file of lockFiles) {
                 const filePath = path.join(locksDir, file);
-                if (file.endsWith('.tmp')) {
-                    // A takeover's pending lock is renamed into place within a few file operations, so an
+                if (file.endsWith('.tmp') || file.endsWith('.lock.takeover')) {
+                    // A takeover guard or pending lock is renamed/removed within a few file operations, so an
                     // old one was left by a crash (see lock.ts).
                     try {
                         const stat = fs.lstatSync(filePath);

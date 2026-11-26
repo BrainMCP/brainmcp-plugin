@@ -121,9 +121,12 @@ export class ApiClient {
             const useStoredAuth = !options.skipAuth && !explicitAuthorization;
             const creds = useStoredAuth ? await this.getEffectiveCredentials() : null;
             signal.throwIfAborted();
-            if (options.expectedAuthorizationId && creds?.authorizationId !== options.expectedAuthorizationId) {
-                throw new Error('Companion authorization changed before the request.');
-            }
+            const requireExpectedAuthorization = (current) => {
+                if (options.expectedAuthorizationId && current?.authorizationId !== options.expectedAuthorizationId) {
+                    throw new Error('Companion authorization changed before the request.');
+                }
+            };
+            requireExpectedAuthorization(creds);
             if (creds?.authType === 'oauth' && creds.reauthRequired) {
                 throw new CompanionReauthRequiredError();
             }
@@ -165,6 +168,7 @@ export class ApiClient {
             if (creds?.authType === 'oauth' && creds.refreshToken && accessTokenExpiresSoon(creds)) {
                 refreshed = true;
                 const renewed = await this.refreshTokensWithLock(token, creds, signal);
+                requireExpectedAuthorization(renewed);
                 if (renewed)
                     token = renewed.accessToken ?? null;
             }
@@ -173,6 +177,7 @@ export class ApiClient {
             if (res.status === 401 && creds?.authType === 'oauth' && creds.refreshToken && !refreshed) {
                 await res.body?.cancel();
                 const refreshed = await this.refreshTokensWithLock(token, creds, signal);
+                requireExpectedAuthorization(refreshed);
                 if (refreshed) {
                     token = refreshed.accessToken ?? null;
                     res = await execute(token);
@@ -240,6 +245,9 @@ export class ApiClient {
                 signal.throwIfAborted();
                 if (current?.authorizationId !== original.authorizationId || current?.userId !== original.userId) {
                     return { kind: 'missing', current: null };
+                }
+                if (current?.authType === 'oauth' && current.reauthRequired) {
+                    throw new CompanionReauthRequiredError();
                 }
                 if (!current || current.authType !== 'oauth' || !current.refreshToken) {
                     return { kind: 'missing', current };

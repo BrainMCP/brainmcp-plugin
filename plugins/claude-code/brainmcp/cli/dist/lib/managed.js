@@ -28,7 +28,7 @@ export function upsertMarkdownBlock(existing, block) {
     assertNoConflictingManagedBlock(current, 'markdown');
     const existingStart = managedStarts(current, 'markdown')[0];
     if (existingStart) {
-        return current.replace(new RegExp(`${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(MARKER_END)}\\n?`), block);
+        return current.replace(new RegExp(`${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(MARKER_END)}(?:\\r?\\n)?`), () => block);
     }
     return `${current}${current && !current.endsWith('\n') ? '\n' : ''}${current ? '\n' : ''}${block}`;
 }
@@ -39,7 +39,7 @@ export function removeMarkdownBlock(existing) {
     const existingStart = managedStarts(existing, 'markdown')[0];
     if (!existingStart)
         return existing;
-    const result = existing.replace(new RegExp(`\\n?${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(MARKER_END)}\\n?`), '').replace(/\n{3,}/g, '\n\n');
+    const result = existing.replace(new RegExp(`(?:\\r?\\n)?${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(MARKER_END)}(?:\\r?\\n)?`), '').replace(/(?:\r?\n){3,}/g, '\n\n');
     return result.trim() ? result : undefined;
 }
 export function upsertTomlBlock(existing, client) {
@@ -48,12 +48,22 @@ export function upsertTomlBlock(existing, client) {
     const block = renderTomlServer(client);
     const existingStart = managedStarts(current, 'toml')[0];
     const updated = existingStart
-        ? current.replace(new RegExp(`${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}\\n?`), block)
+        ? current.replace(new RegExp(`${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}(?:\\r?\\n)?`), () => block)
         : replaceTomlBrainTables(current, block);
+    assertWritableToml(updated);
     // A second definition makes the whole file invalid TOML, so it is never written. An array of tables repeats by design.
-    const brainTables = splitTomlSections(updated).filter(({ isArray }) => !isArray).map(({ name }) => name).filter(isTomlBrainTable);
+    const sections = splitTomlSections(updated);
+    const brainTables = sections.filter(({ isArray }) => !isArray).map(({ name }) => name).filter(isTomlBrainTable);
     if (new Set(brainTables).size !== brainTables.length) {
         throw new CliConfigurationError('Refusing to write a duplicate [mcp_servers.brain] table. Remove the copy outside the BrainMCP markers first.');
+    }
+    if (definesBrainByKey(updated)) {
+        throw new CliConfigurationError('Refusing to add [mcp_servers.brain]: the Codex config already defines brain with a dotted key or an inline table (`mcp_servers.brain.url = ...`, or `brain = { ... }` under [mcp_servers]). Remove that definition first.');
+    }
+    // Only Brain's own tables may change: every other table keeps its place in the file.
+    const otherTables = (text) => splitTomlSections(text).filter(({ name }) => !isTomlBrainTable(name)).map(({ name, isArray }) => `${isArray ? '[[' : '['}${name}`);
+    if (otherTables(current).join('\n') !== otherTables(updated).join('\n')) {
+        throw new CliConfigurationError('Refusing to rewrite the Codex config: the update would change tables other than [mcp_servers.brain]. Back it up and remove the brain tables by hand.');
     }
     return updated;
 }
@@ -65,10 +75,48 @@ export function removeTomlBlock(existing) {
     if (!existingStart)
         return existing;
     // CRLF line breaks go whole: a bare `\r` left behind is invalid TOML.
-    const result = existing
-        .replace(new RegExp(`(?:\\r?\\n)?${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}(?:\\r?\\n)?`), '')
-        .replace(/(\r?\n){3,}/g, '$1$1');
+    const block = new RegExp(`(?:\\r?\\n)?${escapeRegex(existingStart)}[\\s\\S]*?${escapeRegex(TOML_MARKER_END)}(?:\\r?\\n)?`).exec(existing);
+    if (!block)
+        return existing;
+    const result = collapseLineBreaksAt(`${existing.slice(0, block.index)}${existing.slice(block.index + block[0].length)}`, block.index);
+    assertWritableToml(result);
     return result.trim() ? result : undefined;
+}
+/**
+ * Caps the run of line breaks around `at` (where text was cut out) at one blank line. Only that run:
+ * blank lines elsewhere, such as inside a multi-line string, are the user's.
+ */
+function collapseLineBreaksAt(text, at) {
+    let start = at;
+    while (start > 0 && (text[start - 1] === '\n' || text[start - 1] === '\r'))
+        start -= 1;
+    let end = at;
+    while (end < text.length && (text[end] === '\n' || text[end] === '\r'))
+        end += 1;
+    const run = text.slice(start, end);
+    if ((run.match(/\n/g) ?? []).length <= 2)
+        return text;
+    const lineBreak = run.includes('\r') ? '\r\n' : '\n';
+    return `${text.slice(0, start)}${lineBreak}${lineBreak}${text.slice(end)}`;
+}
+/**
+ * Whether brain is defined outside a `[mcp_servers.brain...]` table: by a dotted key
+ * (`mcp_servers.brain.url = ...`) or an inline table (`brain = { ... }` under `[mcp_servers]`). A
+ * `[mcp_servers.brain]` table beside either is a second definition, which Codex refuses to parse.
+ */
+function definesBrainByKey(text) {
+    const { headers, keys } = scanToml(text);
+    return keys.some(({ headerIndex, rawKey }) => {
+        const table = headerIndex < 0 ? '' : canonicalTomlKey(headers[headerIndex].rawName);
+        if (isTomlBrainTable(table))
+            return false;
+        return isTomlBrainTable(canonicalTomlKey(table ? `${table}.${rawKey}` : rawKey));
+    });
+}
+function assertWritableToml(text) {
+    const problem = tomlStructureProblem(text);
+    if (problem)
+        throw new CliConfigurationError(`Refusing to write a Codex config that would not parse as TOML (${problem}). Fix the file first.`);
 }
 function managedStarts(text, format) {
     const pattern = format === 'toml' ? TOML_START_PATTERN : MARKDOWN_START_PATTERN;
@@ -250,9 +298,9 @@ function replaceTomlBrainTables(current, block) {
     let repaired = current;
     // Comment and blank lines that lead into the next, unrelated header belong to it.
     for (const range of mergedRanges.reverse()) {
-        repaired = `${repaired.slice(0, range.start)}${repaired.slice(range.contentEnd)}`;
+        repaired = collapseLineBreaksAt(`${repaired.slice(0, range.start)}${repaired.slice(range.contentEnd)}`, range.start);
     }
-    repaired = repaired.replace(/\n{3,}/g, '\n\n').trimEnd();
+    repaired = repaired.trimEnd();
     return `${repaired}${repaired ? '\n\n' : ''}${block}`;
 }
 /**
@@ -753,22 +801,199 @@ function canonicalTomlKey(raw) {
  * The one TOML table splitter: `init`/`remove` (`replaceTomlBrainTables`),
  * `doctor` and the duplicate-scope check all read sections through it. A
  * header is a whole line, `[name]` or `[[name]]` with an optional trailing
- * comment; a commented-out header is not one. Each section runs to the next
- * header of either kind, so keys under a following `[[array]]` table never
- * count toward the table before it.
+ * comment; a commented-out header is not one, and neither is a line inside a
+ * multi-line string or a multi-line array. A quoted key may hold `]`, as in a
+ * Codex `[projects."/work[2]"]` table. Each section runs to the next header of
+ * either kind, so keys under a following `[[array]]` table never count toward
+ * the table before it.
  */
 export function splitTomlSections(current) {
-    const headers = Array.from(current.matchAll(/^[\t ]*\[(\[?)([^\]\r\n]+)\](\]?)[\t ]*(?:#.*)?$/gm));
+    const { headers } = scanToml(current);
     return headers.map((header, index) => {
-        const start = header.index;
-        const end = headers[index + 1]?.index ?? current.length;
+        const end = headers[index + 1]?.start ?? current.length;
         return {
-            name: canonicalTomlKey(header[2]),
-            isArray: header[1] === '[' && header[3] === ']',
-            start,
+            name: canonicalTomlKey(header.rawName),
+            isArray: header.isArray,
+            start: header.start,
             end,
-            body: current.slice(start + header[0].length, end),
+            body: current.slice(header.headerEnd, end),
         };
     });
+}
+/**
+ * Why `text` cannot be TOML, or null: a string that never closes or brackets that do not pair up.
+ * Not a full parser; a file that fails this would fail Codex's parser too, so it is never written.
+ */
+export function tomlStructureProblem(text) {
+    return scanToml(text).problem;
+}
+/**
+ * One pass over the text that skips comments and strings of all four kinds, and tracks how deep
+ * inline arrays and tables nest, so a header is recognized only where TOML allows one: at the start
+ * of a line, outside any value.
+ */
+function scanToml(text) {
+    const headers = [];
+    const keys = [];
+    let problem = null;
+    let depth = 0;
+    // A byte order mark (an editor on Windows may write one) stays in place before the first line.
+    let index = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+    let lineStart = true;
+    while (index < text.length) {
+        if (lineStart && depth === 0) {
+            let first = index;
+            while (text[first] === ' ' || text[first] === '\t')
+                first += 1;
+            const header = text[first] === '[' ? readTomlHeader(text, first) : null;
+            if (header) {
+                headers.push({ start: index, ...header });
+                index = header.headerEnd;
+                lineStart = false;
+                continue;
+            }
+            const rawKey = readTomlKey(text, first);
+            if (rawKey !== null)
+                keys.push({ headerIndex: headers.length - 1, rawKey });
+        }
+        lineStart = false;
+        const character = text[index];
+        if (character === '\n') {
+            lineStart = true;
+            index += 1;
+        }
+        else if (character === '#') {
+            while (index < text.length && text[index] !== '\n')
+                index += 1;
+        }
+        else if (character === '"' || character === "'") {
+            const end = tomlStringEnd(text, index);
+            if (end < 0) {
+                problem ??= 'a string that never closes';
+                break;
+            }
+            index = end;
+        }
+        else {
+            if (character === '[' || character === '{')
+                depth += 1;
+            else if (character === ']' || character === '}') {
+                if (depth === 0)
+                    problem ??= 'a closing bracket without an opening one';
+                else
+                    depth -= 1;
+            }
+            index += 1;
+        }
+    }
+    if (depth !== 0)
+        problem ??= 'an array or inline table that never closes';
+    return { headers, keys, problem };
+}
+/** The key of the key/value line starting at `start`, as written (dotted parts included), or null. */
+function readTomlKey(text, start) {
+    let index = start;
+    while (index < text.length) {
+        const character = text[index];
+        if (character === '=')
+            return index > start ? text.slice(start, index) : null;
+        if (character === '\n' || character === '\r' || character === '#' || character === '[' || character === '{')
+            return null;
+        if (character === '"' || character === "'") {
+            const end = tomlStringEnd(text, index);
+            if (end < 0 || text.startsWith(character.repeat(3), index))
+                return null;
+            index = end;
+        }
+        else {
+            index += 1;
+        }
+    }
+    return null;
+}
+/**
+ * The header starting at `open` (a `[`), if the rest of its line is one: `[key]` or `[[key]]` and
+ * an optional comment. The key's quoted parts may hold any character; the key itself is kept as
+ * written, for `canonicalTomlKey`. `headerEnd` stops before the line break.
+ */
+function readTomlHeader(text, open) {
+    const isArray = text[open + 1] === '[';
+    const keyStart = open + (isArray ? 2 : 1);
+    let index = keyStart;
+    while (index < text.length && text[index] !== ']') {
+        const character = text[index];
+        if (character === '\n' || character === '\r' || character === '[' || character === '#')
+            return null;
+        if (character === '"' || character === "'") {
+            const end = tomlStringEnd(text, index);
+            // A key is one line: a multi-line string or one that runs past the line is no key.
+            if (end < 0 || text.startsWith(character.repeat(3), index))
+                return null;
+            index = end;
+        }
+        else {
+            index += 1;
+        }
+    }
+    const rawName = text.slice(keyStart, index);
+    if (index >= text.length || !rawName.trim())
+        return null;
+    index += 1;
+    if (isArray) {
+        if (text[index] !== ']')
+            return null;
+        index += 1;
+    }
+    while (text[index] === ' ' || text[index] === '\t')
+        index += 1;
+    if (text[index] === '#') {
+        while (index < text.length && text[index] !== '\n' && text[index] !== '\r')
+            index += 1;
+    }
+    if (index < text.length && text[index] !== '\n' && !(text[index] === '\r' && text[index + 1] === '\n'))
+        return null;
+    return { headerEnd: index, rawName, isArray };
+}
+/**
+ * Where the string opening at `start` ends (the index after its closing quote), or -1 when it never
+ * closes. Basic strings take backslash escapes, literal strings none; a one-line string stops at the
+ * line break. A multi-line string closes at its last run of three to five quotes.
+ */
+function tomlStringEnd(text, start) {
+    const quote = text[start];
+    const escapes = quote === '"';
+    if (text.startsWith(quote.repeat(3), start)) {
+        let index = start + 3;
+        while (index < text.length) {
+            if (escapes && text[index] === '\\') {
+                index += 2;
+                continue;
+            }
+            if (text[index] === quote) {
+                let run = 0;
+                while (text[index + run] === quote)
+                    run += 1;
+                if (run >= 3)
+                    return index + run;
+                index += run;
+                continue;
+            }
+            index += 1;
+        }
+        return -1;
+    }
+    let index = start + 1;
+    while (index < text.length && text[index] !== '\n') {
+        if (escapes && text[index] === '\\') {
+            if (text[index + 1] === '\n' || text[index + 1] === '\r')
+                return -1;
+            index += 2;
+            continue;
+        }
+        if (text[index] === quote)
+            return index + 1;
+        index += 1;
+    }
+    return -1;
 }
 //# sourceMappingURL=managed.js.map

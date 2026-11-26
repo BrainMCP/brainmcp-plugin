@@ -1,6 +1,6 @@
 import { normalizeCaptureTrigger } from '../agent-config.js';
 import { apiPathSegment } from '../api-client.js';
-import { listQueueItems, updateQueueItem, getQueueDir } from './queue.js';
+import { listQueueItems, readQueueItem, updateQueueItem, getQueueDir } from './queue.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { readPreferences, readSafeJson, resolveStateDir, writeAtomic0600 } from './storage.js';
 import { SessionLockTimeoutError, withSessionLock } from './lock.js';
@@ -131,6 +131,8 @@ export function nextRetryAt(attempts, now = Date.now(), jitterMs = Math.floor(Ma
 }
 export function queueByteSize(baseDir) {
     const dir = getQueueDir(baseDir);
+    if (!fs.existsSync(dir))
+        return 0;
     let total = 0;
     for (const entry of fs.readdirSync(dir)) {
         if (!entry.endsWith('.json'))
@@ -185,28 +187,7 @@ async function postDigest(apiClient, item, signal, beforeSend, timeoutMs) {
         return { ok: false, status, message, code };
     }
 }
-/**
- * Hold a waiting item back until `retryAt` without spending an attempt, after
- * its workspace refused another digest for the pending cap. Only an item
- * nobody is sending is touched; a busy queue lock leaves it for the next run.
- */
-async function deferForDigestCap(digestId, retryAt, baseDir) {
-    try {
-        return await withSessionLock('capture-queue', () => {
-            const current = listQueueItems(baseDir).find((queued) => queued.digestId === digestId);
-            if (!current || !['pending', 'delivery_unknown'].includes(current.status) ||
-                (current.deliveryLease && Date.parse(current.deliveryLease.expiresAt) > Date.now()))
-                return false;
-            updateQueueItem(digestId, { nextRetryAt: retryAt, lastErrorCode: DIGEST_CAP_ERROR_CODE }, baseDir);
-            return true;
-        }, { baseDir, timeoutMs: CAPTURE_QUEUE_LOCK_TIMEOUT_MS });
-    }
-    catch (error) {
-        if (error instanceof SessionLockTimeoutError)
-            return false;
-        throw error;
-    }
-}
+const CONSENT_CHANGED = 'Capture consent or project policy changed before delivery';
 export async function flushCaptureQueue(options) {
     // Pin this run to one physical account namespace, including completion after
     // another process switches the active account.
@@ -218,6 +199,7 @@ export async function flushCaptureQueue(options) {
     const credentials = options.credentials === undefined
         ? await options.apiClient.getEffectiveCredentials()
         : options.credentials;
+    const authorizationId = credentials?.authType === 'oauth' ? credentials.authorizationId : undefined;
     /** Workspace id → when its digests may be sent again, after a pending-cap refusal in this run. */
     const cappedWorkspaces = new Map();
     // No usable sign-in to compare against: nothing is sent and nothing is
@@ -257,40 +239,14 @@ export async function flushCaptureQueue(options) {
         const isAutomatic = item.captureTrigger !== 'manual';
         // Rechecked before the claim and again right before the request: the item's
         // own projects, not the starting hook's, decide whether it may leave.
-        const consentStillMatches = () => {
+        const consentStillMatches = (queued) => {
             const prefs = readPreferences(options.baseDir);
             return prefs !== null && captureConsentActive(prefs) &&
-                (!isAutomatic || options.allowAutomatic === true) &&
-                item.consentRevision !== undefined && item.consentRevision === (prefs.consent.revision ?? 0) &&
-                (!isAutomatic || item.workspaceId === prefs.enabledWorkspaceId) &&
-                queuedItemProjectAllowsCapture(item, item.workspaceId);
+                queued.consentRevision !== undefined && queued.consentRevision === (prefs.consent.revision ?? 0) &&
+                (queued.captureTrigger === 'manual' || queued.workspaceId === prefs.enabledWorkspaceId) &&
+                queuedItemProjectAllowsCapture(queued, queued.workspaceId);
         };
-        if (isAutomatic) {
-            if (!consentStillMatches()) {
-                if (item.status === 'pending') {
-                    updateQueueItem(item.digestId, { status: 'cancelled', lastError: 'Capture consent or project policy changed before delivery' }, options.baseDir);
-                }
-                result.skipped += 1;
-                continue;
-            }
-        }
-        const currentAuthorizationId = credentials?.authType === 'oauth' ? credentials.authorizationId : undefined;
-        if (!item.authorizationId || !currentAuthorizationId || item.authorizationId !== currentAuthorizationId) {
-            updateQueueItem(item.digestId, { status: 'cancelled', lastError: 'Capture item belongs to a different or unknown authorization' }, options.baseDir);
-            result.skipped += 1;
-            continue;
-        }
-        if (!credentials?.scopes?.includes('digests:write') || !credentials.workspaces?.includes(item.workspaceId)) {
-            result.skipped += 1;
-            continue;
-        }
-        const capRetryAt = cappedWorkspaces.get(item.workspaceId);
-        if (capRetryAt) {
-            // Its workspace refused a digest for the pending cap in this run, and
-            // would refuse this one the same way.
-            if (await deferForDigestCap(item.digestId, capRetryAt, options.baseDir)) {
-                result.deferredForDigestCap = (result.deferredForDigestCap ?? 0) + 1;
-            }
+        if (isAutomatic && options.allowAutomatic !== true) {
             result.skipped += 1;
             continue;
         }
@@ -301,12 +257,43 @@ export async function flushCaptureQueue(options) {
         let statusBeforeClaim = item.status;
         try {
             claimed = await withSessionLock('capture-queue', () => {
-                const current = listQueueItems(options.baseDir).find((queued) => queued.digestId === item.digestId);
+                // Consent, cancellation and claiming all act on the current entry, not
+                // the snapshot taken before loading credentials or sending another item.
+                const current = readQueueItem(item.digestId, options.baseDir);
                 if (!current || ['delivered', 'cancelled', 'failed'].includes(current.status) ||
                     (current.deliveryLease && Date.parse(current.deliveryLease.expiresAt) > Date.now()) ||
                     (current.nextRetryAt && Date.parse(current.nextRetryAt) > now) ||
-                    !consentStillMatches() || options.signal?.aborted)
+                    options.signal?.aborted)
                     return null;
+                const consentMatches = consentStillMatches(current);
+                if (current.captureTrigger !== 'manual' && !consentMatches) {
+                    if (current.status === 'pending') {
+                        updateQueueItem(current.digestId, { status: 'cancelled', lastError: CONSENT_CHANGED, deliveryLease: undefined }, options.baseDir);
+                    }
+                    return null;
+                }
+                if (!authorizationId || current.authorizationId !== authorizationId) {
+                    // Only cancel unsent pending items when signed in under a different OAuth
+                    // grant; preserve delivery_unknown/in-flight ambiguity and do not cancel
+                    // OAuth queue items when running with a non-OAuth service credential.
+                    if (credentials.authType === 'oauth' && current.status === 'pending') {
+                        updateQueueItem(current.digestId, { status: 'cancelled', lastError: 'Capture item belongs to a different or unknown authorization',
+                            deliveryLease: undefined }, options.baseDir);
+                    }
+                    return null;
+                }
+                if (!consentMatches || !credentials.scopes?.includes('digests:write') ||
+                    !credentials.workspaces?.includes(current.workspaceId))
+                    return null;
+                const capRetryAt = cappedWorkspaces.get(current.workspaceId);
+                if (capRetryAt) {
+                    // This workspace refused another digest for the pending cap in this run.
+                    if (current.status === 'pending' || current.status === 'delivery_unknown') {
+                        updateQueueItem(current.digestId, { nextRetryAt: capRetryAt, lastErrorCode: DIGEST_CAP_ERROR_CODE }, options.baseDir);
+                        result.deferredForDigestCap = (result.deferredForDigestCap ?? 0) + 1;
+                    }
+                    return null;
+                }
                 statusBeforeClaim = current.status === 'sending' ? 'delivery_unknown' : current.status;
                 return updateQueueItem(item.digestId, { status: 'sending', deliveryLease: { owner,
                         expiresAt: new Date(Date.now() + requestTimeoutMs + DELIVERY_LEASE_HEADROOM_MS).toISOString() } }, options.baseDir);
@@ -332,9 +319,15 @@ export async function flushCaptureQueue(options) {
                     // The server accepted the digest even if another run took this item over since.
                     if (updates.status === 'delivered' && updates.deliveredAt)
                         recordCaptureDelivery(updates.deliveredAt, options.baseDir);
-                    const current = listQueueItems(options.baseDir).find((queued) => queued.digestId === item.digestId);
-                    if (current?.deliveryLease?.owner !== owner)
+                    getQueueDir(options.baseDir, true);
+                    const current = readQueueItem(item.digestId, options.baseDir);
+                    if (current?.status !== 'sending' || current.deliveryLease?.owner !== owner)
                         return;
+                    if (isAutomatic && (updates.status === 'pending' || updates.status === 'failed') && !consentStillMatches(current)) {
+                        updates = statusBeforeClaim === 'delivery_unknown'
+                            ? { ...updates, status: 'delivery_unknown' }
+                            : { ...updates, status: 'cancelled', lastError: CONSENT_CHANGED, lastErrorCode: undefined, nextRetryAt: undefined };
+                    }
                     updateQueueItem(item.digestId, { ...updates, deliveryLease: undefined }, options.baseDir);
                 }, { baseDir: options.baseDir, timeoutMs: CAPTURE_QUEUE_LOCK_TIMEOUT_MS });
             }
@@ -350,9 +343,12 @@ export async function flushCaptureQueue(options) {
             }
         };
         let handedToNetwork = false;
+        let consentWithdrawn = false;
         const response = await postDigest(options.apiClient, claimed, options.signal, () => {
-            if (!consentStillMatches())
+            if (!consentStillMatches(claimed)) {
+                consentWithdrawn = true;
                 return false;
+            }
             result.requests += 1;
             handedToNetwork = true;
             return true;
@@ -360,6 +356,13 @@ export async function flushCaptureQueue(options) {
         if (response.ok) {
             await finish({ status: 'delivered', deliveredAt: new Date().toISOString(), lastError: undefined, lastErrorCode: undefined, nextRetryAt: undefined });
             result.sent += 1;
+            continue;
+        }
+        if (isAutomatic && consentWithdrawn) {
+            await finish(statusBeforeClaim === 'delivery_unknown'
+                ? { status: 'delivery_unknown' }
+                : { status: 'cancelled', lastError: CONSENT_CHANGED, lastErrorCode: undefined, nextRetryAt: undefined });
+            result.skipped += 1;
             continue;
         }
         // The caller's own deadline (a hook budget or the background run ending) is

@@ -2,15 +2,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { QUEUE_SCHEMA_VERSION, validateQueueItemRecord, } from '../lib/cli-contracts.js';
 import { ensureDirectory0700, writeAtomic0600, readSafeJson, assertNotSymlink, resolveStateDir, } from './storage.js';
-export function getQueueDir(baseDir) {
+export function getQueueDir(baseDir, create = false) {
     const queueDir = path.join(resolveStateDir(baseDir), 'queue');
-    ensureDirectory0700(queueDir);
+    if (create)
+        ensureDirectory0700(queueDir);
     return queueDir;
 }
-export function getQueueItemPath(digestId, baseDir) {
-    const queueDir = getQueueDir(baseDir);
+export function getQueueItemPath(digestId, baseDir, create = false) {
+    const queueDir = getQueueDir(baseDir, create);
     const safeId = digestId.replace(/[^a-zA-Z0-9_-]/g, '_');
     return path.join(queueDir, `${safeId}.json`);
+}
+export function readQueueItem(digestId, baseDir) {
+    const filePath = getQueueItemPath(digestId, baseDir, false);
+    try {
+        const item = readSafeJson(filePath, validateQueueItemRecord);
+        return item?.digestId === digestId ? item : null;
+    }
+    catch {
+        // A damaged entry is skipped here just as it is in listQueueItems.
+        return null;
+    }
 }
 export function enqueueCaptureItem(item, baseDir) {
     const now = new Date().toISOString();
@@ -29,12 +41,14 @@ export function enqueueCaptureItem(item, baseDir) {
         createdAt: now,
         updatedAt: now,
     };
-    const filePath = getQueueItemPath(record.digestId, baseDir);
+    const filePath = getQueueItemPath(record.digestId, baseDir, true);
     writeAtomic0600(filePath, JSON.stringify(record, null, 2));
     return record;
 }
 export function listQueueItems(baseDir) {
-    const queueDir = getQueueDir(baseDir);
+    const queueDir = getQueueDir(baseDir, false);
+    if (!fs.existsSync(queueDir))
+        return [];
     const entries = fs.readdirSync(queueDir);
     const items = [];
     for (const entry of entries) {
@@ -56,7 +70,7 @@ export function listQueueItems(baseDir) {
     return items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 export function updateQueueItem(digestId, updates, baseDir) {
-    const filePath = getQueueItemPath(digestId, baseDir);
+    const filePath = getQueueItemPath(digestId, baseDir, true);
     const existing = readSafeJson(filePath, validateQueueItemRecord);
     if (!existing) {
         return null;
@@ -70,7 +84,7 @@ export function updateQueueItem(digestId, updates, baseDir) {
     return updated;
 }
 export function removeQueueItem(digestId, baseDir) {
-    const filePath = getQueueItemPath(digestId, baseDir);
+    const filePath = getQueueItemPath(digestId, baseDir, false);
     if (fs.existsSync(filePath)) {
         assertNotSymlink(filePath);
         fs.unlinkSync(filePath);

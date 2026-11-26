@@ -83,7 +83,11 @@ export class OAuthClient {
         validateHttpUrl(this.issuer);
     }
     async discoverEndpoints(signal) {
-        const discoveryUrl = `${this.issuer}/.well-known/oauth-authorization-server`;
+        const parsedIssuer = new URL(this.issuer);
+        const issuerPath = parsedIssuer.pathname.replace(/\/+$/, '');
+        // RFC 8414 §3.1 inserts /.well-known/oauth-authorization-server before any issuer path.
+        const discoveryUrl = `${parsedIssuer.origin}/.well-known/oauth-authorization-server${issuerPath}`;
+        const fallbackAuthBase = issuerPath ? this.issuer : `${this.issuer}/api/auth`;
         return withRequestDeadline(this.timeoutMs, signal, async (requestSignal) => {
             const res = await this.fetchFn(discoveryUrl, { signal: requestSignal, redirect: 'error' });
             if (res.ok) {
@@ -91,9 +95,9 @@ export class OAuthClient {
                 if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
                     const endpoints = {
                         issuer: meta.issuer ?? this.issuer,
-                        authorizationEndpoint: meta.authorization_endpoint ?? `${this.issuer}/api/auth/oauth2/authorize`,
-                        tokenEndpoint: meta.token_endpoint ?? `${this.issuer}/api/auth/oauth2/token`,
-                        revocationEndpoint: meta.revocation_endpoint ?? `${this.issuer}/api/auth/oauth2/revoke`,
+                        authorizationEndpoint: meta.authorization_endpoint ?? `${fallbackAuthBase}/oauth2/authorize`,
+                        tokenEndpoint: meta.token_endpoint ?? `${fallbackAuthBase}/oauth2/token`,
+                        revocationEndpoint: meta.revocation_endpoint ?? `${fallbackAuthBase}/oauth2/revoke`,
                     };
                     for (const endpoint of Object.values(endpoints))
                         validateHttpUrl(endpoint, this.issuer);
@@ -105,9 +109,9 @@ export class OAuthClient {
                 throw new Error(`OAuth discovery failed (status ${res.status}).`);
             return {
                 issuer: this.issuer,
-                authorizationEndpoint: `${this.issuer}/api/auth/oauth2/authorize`,
-                tokenEndpoint: `${this.issuer}/api/auth/oauth2/token`,
-                revocationEndpoint: `${this.issuer}/api/auth/oauth2/revoke`,
+                authorizationEndpoint: `${fallbackAuthBase}/oauth2/authorize`,
+                tokenEndpoint: `${fallbackAuthBase}/oauth2/token`,
+                revocationEndpoint: `${fallbackAuthBase}/oauth2/revoke`,
             };
         });
     }

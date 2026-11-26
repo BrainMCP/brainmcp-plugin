@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { validatePreferencesRecord } from '../lib/cli-contracts.js';
 import { DIGEST_CAP_ERROR_CODE, queueItemFailureClass } from './flush.js';
-import { describeCredentialsError, parseStoredCredentials, readVaultMarker, readVaultRecord, validateStoredCredentials } from '../lib/credentials.js';
+import { describeCredentialsError, parseStoredCredentials, readCredentialFile, readVaultMarker, readVaultRecord, validateStoredCredentials } from '../lib/credentials.js';
 import { getBrainHome, getCurrentAccountId, readSafeJson, resolveStateDir } from './storage.js';
 import { listInstalledRuntimes, readRuntimeShimTarget } from './installer.js';
 import { listQueueItems } from './queue.js';
@@ -12,13 +12,23 @@ import { createPlatformVault, LEGACY_VAULT_ACCOUNT, vaultAccountKey } from '../l
 import { describeMisdirectedCompanionApi, resolveCompanionApiUrl } from '../lib/endpoints.js';
 export async function checkCredentialHealth(baseDir, options) {
     const home = baseDir ?? getBrainHome();
-    const stateDir = resolveStateDir(home);
-    const credPath = path.join(stateDir, 'credentials.json');
-    const backendMarker = path.join(stateDir, 'credentials.backend.json');
-    const markerPresent = fs.existsSync(backendMarker);
-    if (fs.existsSync(credPath)) {
-        return readFileCredentialHealth(credPath);
+    let stateDir;
+    try {
+        stateDir = resolveStateDir(home);
     }
+    catch (error) {
+        return {
+            name: 'credential health',
+            passed: false,
+            detail: `credential directory unavailable: ${describeCredentialsError(error)}`,
+            repairGuidance: 'Restore the BrainMCP account directory as a regular directory owned by you. On Unix use chmod 700 for the directory.',
+        };
+    }
+    const fileHealth = readFileCredentialHealth(path.join(stateDir, 'credentials.json'));
+    if (fileHealth)
+        return fileHealth;
+    const backendMarker = path.join(stateDir, 'credentials.backend.json');
+    const markerPresent = Boolean(fs.lstatSync(backendMarker, { throwIfNoEntry: false }));
     const vault = options?.vault ?? (options?.probeVault ? createPlatformVault() : null);
     if (vault && markerPresent) {
         try {
@@ -134,20 +144,22 @@ function oauthGrantHealth(raw, location) {
     };
 }
 function readFileCredentialHealth(credPath) {
-    let credentials;
+    let repairGuidance = 'Use a regular credentials.json owned by you. On Unix use chmod 600 for the file and chmod 700 for its directory.';
     try {
-        // Same record and validator as the credential store (lib/credentials.ts).
-        credentials = parseStoredCredentials(fs.readFileSync(credPath, 'utf8'));
+        if (!fs.lstatSync(credPath, { throwIfNoEntry: false }))
+            return null;
+        const raw = readCredentialFile(credPath);
+        repairGuidance = 'Run "brainmcp login --force" to reset corrupt credentials';
+        return storedCredentialHealth(parseStoredCredentials(raw), 'credentials.json');
     }
     catch (error) {
         return {
             name: 'credential health',
             passed: false,
             detail: `invalid credentials file: ${describeCredentialsError(error)}`,
-            repairGuidance: 'Run "brainmcp login --force" to reset corrupt credentials',
+            repairGuidance,
         };
     }
-    return storedCredentialHealth(credentials, 'credentials.json');
 }
 export function checkRuntimeDrift(expectedVersion, baseDir) {
     const installed = listInstalledRuntimes(baseDir);
@@ -189,15 +201,15 @@ export function checkRuntimeDrift(expectedVersion, baseDir) {
     };
 }
 export function checkConsentPreferences(baseDir) {
-    const prefPath = path.join(resolveStateDir(baseDir), 'preferences.json');
-    if (!fs.existsSync(prefPath)) {
-        return {
-            name: 'capture consent',
-            passed: true,
-            detail: 'default preferences (capture disabled by default)',
-        };
-    }
     try {
+        const prefPath = path.join(resolveStateDir(baseDir), 'preferences.json');
+        if (!fs.lstatSync(prefPath, { throwIfNoEntry: false })) {
+            return {
+                name: 'capture consent',
+                passed: true,
+                detail: 'default preferences (capture disabled by default)',
+            };
+        }
         const prefs = readSafeJson(prefPath, validatePreferencesRecord);
         if (!prefs) {
             return {

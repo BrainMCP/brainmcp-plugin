@@ -1,6 +1,6 @@
 # brainMCP for Claude Code
 
-Version 0.1.48 (guidance 2026.11.19). Shared, reviewable project memory for coding agents: Claude orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
+Version 0.1.49 (guidance 2026.11.19). Shared, reviewable project memory for coding agents: Claude orients from your Brain workspace before work and proposes durable learnings back as reviewable changes.
 
 ## Install
 
@@ -25,11 +25,11 @@ If your network blocks Dynamic Client Registration, add the server with the stat
 - `.mcp.json`: the `brain` server, shown as `plugin:brainmcp:brain`.
 - `skills/using-brainmcp` (how to use Brain, including the [Proposal review workflow](skills/using-brainmcp/references/session-workflow.md#proposal-review)) and `skills/setup` (sign-in, capture, diagnosis).
 - `hooks/hooks.json`: SessionStart, UserPromptSubmit, PostToolUse, PreCompact, and SessionEnd. Hooks inject context; they cannot force a tool call.
-- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.48, unmodified and unbundled.
+- `cli/`: the `@brainmcp/brainmcp` CLI 0.1.49, unbundled (compiled JS without source maps, type declarations, or the standalone init hook bundle).
 
 A plugin cannot write CLAUDE.md, so every session start adds Brain's always-on guidance (guidance 2026.11.19, in compact form), signed in or not. It leaves that out when `~/.claude/CLAUDE.md` (under `CLAUDE_CONFIG_DIR` when that is set) or the CLAUDE.md at the project root already has the block `brainmcp init` writes for the same guidance version.
 
-If you also ran `brainmcp init` for Claude Code, rerun it: with the plugin enabled it removes its own MCP entry and hooks and keeps only its guidance, so Brain loads once.
+If you also ran `brainmcp init` for Claude Code, rerun it with `--scope user`: with the plugin enabled it removes its user-scope MCP entry and hooks and keeps only its guidance, so Brain loads once (use `brainmcp remove --client claude-code --scope project` for a project-scope install).
 
 ## What it connects to and stores
 
@@ -38,6 +38,6 @@ If you also ran `brainmcp init` for Claude Code, rerun it: with the plugin enabl
 - **Companion sign-in** (`login`) uses OAuth discovery at `https://mcp.brainmcp.ai` and the authorization and token endpoints at `https://dash.brainmcp.ai`. Tokens are kept in the OS credential vault, or an owner-only file in `~/.brainmcp` if you allow it.
 - **Orientation**: at session start, signed-in hooks read workspace context from `https://api.brainmcp.ai` (`/api/mcp/workspaces`, `/api/workspaces/<id>/orient`). No prompt text is sent.
 - **Session capture is off by default.** After `login --capture-digests`, hooks keep a local session ledger in `~/.brainmcp` (prompts only if you also allow them), read the tail of the host's session transcript at PreCompact and SessionEnd and keep only the closing assistant message of each of the latest 3 turns (up to 1,500 characters each), read Git metadata (`git rev-parse`, `branch --show-current`, `diff --numstat`, `status --porcelain`), and a detached background process posts session digests to `https://api.brainmcp.ai/api/workspaces/<id>/digests`. A project can refuse capture with `.brainmcp.json`.
-- **Local files**: `~/.brainmcp` holds preferences, session ledgers, the capture queue, an orientation cache, and `logs/runtime.log`. Uninstalling the plugin leaves it; run `logout` and `capture purge-local` first to clear it.
+- **Local files**: `~/.brainmcp` holds preferences, session ledgers, the capture queue, and `logs/runtime.log`. Uninstalling the plugin leaves it; run `logout` and `capture purge-local` first to clear it.
 
 Privacy policy: https://www.brainmcp.ai/privacy · Terms: https://www.brainmcp.ai/terms · Security: https://www.brainmcp.ai/security · Contact: team@brainmcp.ai

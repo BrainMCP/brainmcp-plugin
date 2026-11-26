@@ -167,8 +167,8 @@ export async function captureEnable(options) {
         },
     };
 }
-export function captureDisable(options) {
-    const updated = disableCapture({
+export async function captureDisable(options) {
+    const updated = await disableCapture({
         baseDir: options?.baseDir,
     });
     return {
@@ -177,7 +177,7 @@ export function captureDisable(options) {
             enabled: false,
             includePrompts: false,
             policyVersion: updated.consent.policyVersion,
-            message: 'Digest capture disabled and pending automatic items cancelled.',
+            message: 'Digest capture disabled. Queued automatic items from the previous consent will no longer be sent.',
         },
     };
 }
@@ -415,7 +415,7 @@ async function settleSlice(run, item) {
             if (current?.status !== 'failed' || queueItemFailureClass(current) !== 'retry_exhausted')
                 return false;
             return Boolean(updateQueueItem(item.digestId, {
-                status: 'pending', attempts: 0, nextRetryAt: undefined, failureClass: undefined, lastError: undefined,
+                status: 'pending', attempts: 0, nextRetryAt: undefined, failureClass: undefined, lastError: undefined, lastErrorCode: undefined,
             }, run.baseDir));
         }, { baseDir: run.baseDir, timeoutMs: 250 });
         if (!reset)
@@ -718,6 +718,16 @@ async function captureSessionSlice(options, getApiClient, requeueOnce) {
                     },
                 };
             }
+        }
+        if (reserved.kind === 'consent_changed') {
+            return {
+                exitCode: CLI_EXIT_CODES.PERMISSION_DENIED,
+                data: {
+                    captured: false,
+                    requestsSent: earlier?.requests ?? 0,
+                    message: 'Capture consent changed before this session slice could be queued.',
+                },
+            };
         }
         if (reserved.kind === 'already_captured') {
             // A lifecycle hook reserved this slice between the ledger read and the lock.

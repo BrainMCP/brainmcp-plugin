@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import { SESSION_LEDGER_SCHEMA_VERSION, validateSessionLedgerRecord, scrubSecrets, truncateCodePoints, MAX_ASSISTANT_SUMMARY_CHARS, } from '../lib/cli-contracts.js';
 import { enqueueCaptureItem, listQueueItems } from './queue.js';
 import { canEnqueueCapture } from './flush.js';
-import { ensureDirectory0700, getBrainHome, writeAtomic0600, readSafeJson, resolveStateDir } from './storage.js';
+import { captureConsentActive } from './capture.js';
+import { ensureDirectory0700, getBrainHome, writeAtomic0600, readPreferences, readSafeJson, resolveStateDir } from './storage.js';
 import { withSessionLock } from './lock.js';
 /**
  * A Brain tool's own name without the host's MCP prefix. Hosts prefix MCP tools
@@ -314,19 +315,25 @@ export function sessionSliceDigestId(input) {
 }
 /** Reserve a sequence and enqueue it in the same local critical section. */
 export async function queueSessionCapture(input) {
+    const baseDir = resolveStateDir(input.baseDir);
     return withSessionLock(input.sessionKey, () => withSessionLock('capture-queue', () => {
-        const ledger = loadSessionLedger(input.sessionKey, input.baseDir);
+        // Capture may have been disabled or re-enabled while waiting for either lock.
+        const prefs = readPreferences(baseDir);
+        if (!captureConsentActive(prefs) || (prefs?.consent.revision ?? 0) !== input.item.consentRevision) {
+            return { kind: 'consent_changed' };
+        }
+        const ledger = loadSessionLedger(input.sessionKey, baseDir);
         const capturedThrough = ledger.lastCapturedSequence ?? 0;
         if (capturedThrough >= input.capturedThroughSequence) {
             return { kind: 'already_captured', capturedThroughSequence: capturedThrough };
         }
         const digestId = sessionSliceDigestId({ ...input.item, sessionKey: input.sessionKey,
             capturedThroughSequence: input.capturedThroughSequence });
-        let item = listQueueItems(input.baseDir).find((queued) => queued.digestId === digestId);
+        let item = listQueueItems(baseDir).find((queued) => queued.digestId === digestId);
         const kind = item ? 'existing' : 'queued';
         if (!item) {
             // Only a genuinely new slice counts against the cap.
-            if (!canEnqueueCapture(input.baseDir))
+            if (!canEnqueueCapture(baseDir))
                 return { kind: 'queue_full' };
             let digestText = input.item.digestText;
             try {
@@ -335,14 +342,14 @@ export async function queueSessionCapture(input) {
                     digestText = JSON.stringify({ ...payload, clientDigestId: digestId });
             }
             catch { /* A bounded plain-text digest is also valid. */ }
-            item = enqueueCaptureItem({ ...input.item, digestId, digestText }, input.baseDir);
+            item = enqueueCaptureItem({ ...input.item, digestId, digestText }, baseDir);
         }
         ledger.lastCapturedAt = item.createdAt;
         ledger.lastCapturedSequence = input.capturedThroughSequence;
         ledger.deliveryIds = [...ledger.deliveryIds, item.digestId].slice(-100);
-        saveSessionLedger(input.sessionKey, ledger, input.baseDir);
+        saveSessionLedger(input.sessionKey, ledger, baseDir);
         return { kind, item };
-    }, { baseDir: input.baseDir, timeoutMs: 250 }), { baseDir: input.baseDir, timeoutMs: 250 });
+    }, { baseDir, timeoutMs: 250 }), { baseDir, timeoutMs: 250 });
 }
 export async function markSessionNudged(input) {
     return withSessionLock(input.sessionKey, async () => {

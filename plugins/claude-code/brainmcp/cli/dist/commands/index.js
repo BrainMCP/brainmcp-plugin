@@ -48,9 +48,10 @@ export async function chooseClient(options) {
 }
 export async function init(options) {
     const client = await chooseClient(options);
-    await assertSingleMcpConfigScope(options, [client]);
     const workspace = resolveWorkspace(options.workspace);
     const plugin = replacingPlugin(options, client);
+    if (!plugin)
+        await assertSingleMcpConfigScope(options, [client]);
     const changes = await plannedChanges(options, client, workspace, 'init', plugin);
     await previewAndApply(changes, options);
     options.output(`BrainMCP configured for ${clientLabel(client)}.`);
@@ -60,8 +61,8 @@ export async function init(options) {
 }
 export async function initAll(options) {
     const workspace = resolveWorkspace(options.workspace);
-    await assertSingleMcpConfigScope(options, BRAINMCP_GLOBAL_CLIENTS);
     const plugins = BRAINMCP_GLOBAL_CLIENTS.map((client) => replacingPlugin(options, client));
+    await assertSingleMcpConfigScope(options, BRAINMCP_GLOBAL_CLIENTS.filter((_client, index) => !plugins[index]));
     const groups = await Promise.all(BRAINMCP_GLOBAL_CLIENTS.map((client, index) => plannedChanges(options, client, workspace, 'init', plugins[index])));
     await previewAndApply(mergeFileChanges(groups.flat()), options);
     options.output(`BrainMCP configured for ${BRAINMCP_GLOBAL_CLIENTS.map(clientLabel).join(', ')}.`);
@@ -357,18 +358,18 @@ export async function doctor(options) {
         if ((client === 'vscode' || client === 'copilot') && options.scope === 'user') {
             checks.push([
                 'user instruction frontmatter',
-                guidance.startsWith('---\n') &&
-                    /^applyTo:\s*["']\*\*["']$/m.test(guidance) &&
-                    guidance.includes('\n---\n'),
+                normalizedGuidance.startsWith('---\n') &&
+                    /^applyTo:\s*["']\*\*["']$/m.test(normalizedGuidance) &&
+                    normalizedGuidance.includes('\n---\n'),
                 'always-on VS Code user instruction',
             ]);
         }
         if (client === 'antigravity' && options.scope === 'project') {
             checks.push([
                 'workspace rule frontmatter',
-                guidance.startsWith('---\n') &&
-                    /^trigger:\s*always_on$/m.test(guidance) &&
-                    guidance.includes('\n---\n'),
+                normalizedGuidance.startsWith('---\n') &&
+                    /^trigger:\s*always_on$/m.test(normalizedGuidance) &&
+                    normalizedGuidance.includes('\n---\n'),
                 'always-on Antigravity workspace rule',
             ]);
         }
@@ -465,7 +466,7 @@ export async function doctor(options) {
             };
         }),
         // Local, but listed here to keep the established check order.
-        Promise.resolve([apiOriginCheck.name, apiOriginCheck.passed, apiOriginCheck.detail]),
+        Promise.resolve([apiOriginCheck.name, apiOriginCheck.passed, apiOriginCheck.detail, apiOriginCheck.repairGuidance]),
         probe('companion workspaces endpoint', async (request) => {
             const workspacesUrl = companionWorkspacesUrl();
             const workspaces = await request(workspacesUrl, { headers: { accept: 'application/json' } });
@@ -481,19 +482,19 @@ export async function doctor(options) {
     checks.push(...await Promise.all(networkChecks));
     const brainHome = brainHomeFor(options);
     const credCheck = await checkCredentialHealth(brainHome, { probeVault: !options.home });
-    checks.push([credCheck.name, credCheck.passed, credCheck.detail]);
+    checks.push([credCheck.name, credCheck.passed, credCheck.detail, credCheck.repairGuidance]);
     if (plugin) {
         checks.push(['hook runtime', true, `the plugin's hooks run its own vendored CLI${plugin.version ? ` ${plugin.version}` : ''}`]);
     }
     // Hooks init wrote beside a plugin (Codex fallbacks, the write-back nudge) run init's runtime.
     if (!plugin || managedEvents.length > 0) {
         const driftCheck = checkRuntimeDrift(cliPackageVersion(), brainHome);
-        checks.push([driftCheck.name, driftCheck.passed, driftCheck.detail]);
+        checks.push([driftCheck.name, driftCheck.passed, driftCheck.detail, driftCheck.repairGuidance]);
     }
     const consentCheck = checkConsentPreferences(brainHome);
-    checks.push([consentCheck.name, consentCheck.passed, consentCheck.detail]);
+    checks.push([consentCheck.name, consentCheck.passed, consentCheck.detail, consentCheck.repairGuidance]);
     const queueCheck = checkQueueStatus(brainHome);
-    checks.push([queueCheck.name, queueCheck.passed, queueCheck.detail]);
+    checks.push([queueCheck.name, queueCheck.passed, queueCheck.detail, queueCheck.repairGuidance]);
     if (options.scope === 'project')
         checks.push(checkProjectBinding(options.root, brainHome));
     // Informational: releases through 0.1.38 left `<file>.brainmcp.bak-*` copies
@@ -507,8 +508,11 @@ export async function doctor(options) {
             `${legacyBackups.length} .brainmcp.bak-* ${legacyBackups.length === 1 ? 'copy' : 'copies'} from an earlier release beside the configuration: ${shown.join(', ')}${legacyBackups.length > shown.length ? `, and ${legacyBackups.length - shown.length} more` : ''}. BrainMCP no longer writes or deletes these; new backups go to ${getBackupsDir(brainHome)} (pruned after ${BACKUP_MAX_AGE_MS / 86_400_000} days, at most ${BACKUP_MAX_PER_FILE} per file). Delete them once you no longer need them`,
         ]);
     }
-    for (const [name, passed, detail] of checks)
+    for (const [name, passed, detail, repair] of checks) {
         options.output(`${passed ? '✓' : '✗'} ${name}: ${detail}`);
+        if (repair)
+            options.output(`  ${repair}`);
+    }
     if (checks.some(([, passed]) => !passed))
         throw new CliConfigurationError('BrainMCP doctor found configuration issues.');
 }
@@ -701,9 +705,16 @@ plugin) {
                 continue;
             }
             const siblingConfig = await readText(siblingTarget.configPath);
-            if (siblingConfig !== undefined && hasBrainServerConfig(siblingConfig, siblingTarget)) {
-                preserveSharedGuidance = true;
-                break;
+            if (siblingConfig !== undefined) {
+                try {
+                    if (hasBrainServerConfig(siblingConfig, siblingTarget)) {
+                        preserveSharedGuidance = true;
+                        break;
+                    }
+                }
+                catch {
+                    // Ignore malformed sibling host configs so removing this client is not blocked.
+                }
             }
         }
     }

@@ -27,7 +27,8 @@ export function buildHookCommand(runtimePath, host, event, options) {
         throw new Error('Invalid managed hook host or event.');
     if (runtimePath === PROJECT_HOOK_RUNTIME)
         return `node ${runtimePath} ${host} ${event}${mode} --managed-tag=${HOOK_MANAGED_TAG}`;
-    if (process.platform === 'win32' && /[%!"\r\n]/.test(runtimePath))
+    // Inside double quotes cmd expands `%` and `!`, and PowerShell and Git Bash expand `$` and the backtick.
+    if (process.platform === 'win32' && /[%!"$`\r\n]/.test(runtimePath))
         throw new Error('The Windows hook runtime path contains shell expansion characters. Choose a BRAINMCP_HOME without them.');
     const quotedPath = process.platform === 'win32' ? `"${runtimePath}"` : escapeShellArg(runtimePath);
     return `node ${quotedPath} ${host} ${event}${mode} --managed-tag=${HOOK_MANAGED_TAG}`;

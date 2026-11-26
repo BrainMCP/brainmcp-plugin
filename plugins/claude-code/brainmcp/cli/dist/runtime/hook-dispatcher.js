@@ -9,6 +9,7 @@ import { pruneLocalState } from './retention.js';
 import { withRequestDeadline } from '../lib/http.js';
 import { captureTriggerForEvent, tryCaptureProjectKey, buildDigestPayload, collectGitMetadata, isCaptureEligible, captureConsentActive, isStopEvent, readProjectCaptureRestrictions, projectBindingBlocksCapture, queueProjectRoots, resolveCaptureWorkspaceId, serializeDigestPayload, } from './capture.js';
 import { canEnqueueCapture } from './flush.js';
+import { hasEligibleAutomaticDelivery } from './background-flush.js';
 import { readTranscriptSummary } from './transcript-summary.js';
 import { companionOrientationFailedMessage, isSessionStartEvent, isUserPromptEvent, loginOrientationMessage, safeSessionStartOrientation, SESSION_START_MAX_TIMEOUT_MS, SESSION_START_TIMEOUT_MS, } from './orient.js';
 import { pluginSessionStartContext } from './plugin-guidance.js';
@@ -319,7 +320,7 @@ function pluginContext(event, context, lookup) {
  * deliver its always-on guidance, which is local text, so the hook still sends
  * it, with a note that companion orientation did not finish.
  */
-function pluginSessionStartFailureOutput(event, failureClass, lookup) {
+export function pluginSessionStartFailureOutput(event, failureClass, lookup) {
     try {
         return hostOutput(event, pluginContext(event, companionOrientationFailedMessage([failureClass]), lookup));
     }
@@ -581,7 +582,20 @@ export async function dispatchHookEvent(event, options) {
                 outputPayload: hostOutput(event),
             };
         }
-        const { apiClient, creds } = await withRequestDeadline(timeoutMs, controller.signal, () => loadRuntimeClient(credentialOptions));
+        const trigger = captureTriggerForEvent(event.event);
+        const hasUncapturedMeaningfulSlice = ledger !== null && (ledger.lastMeaningfulSequence ?? 0) > (ledger.lastCapturedSequence ?? 0);
+        const willAttemptCapture = Boolean(trigger &&
+            isCaptureEligible(event.event, prefs, projectPolicy) &&
+            hasUncapturedMeaningfulSlice);
+        const allowAutomatic = captureConsentActive(prefs) && !projectPolicy.captureDisabled;
+        // Avoid spawning OS keychain/vault subprocesses on every PostToolUse / UserPromptSubmit
+        // when neither orientation, capture enqueue, nor a due queued digest needs credentials.
+        const needsCredentials = isSessionStartEvent(event.event) ||
+            willAttemptCapture ||
+            (allowAutomatic && Boolean(options?.startBackgroundFlush) && hasEligibleAutomaticDelivery(options?.baseDir));
+        const { apiClient, creds } = needsCredentials
+            ? await withRequestDeadline(timeoutMs, controller.signal, () => loadRuntimeClient(credentialOptions))
+            : { apiClient: null, creds: null };
         let additionalContext;
         if (isSessionStartEvent(event.event)) {
             additionalContext = apiClient
@@ -607,11 +621,7 @@ export async function dispatchHookEvent(event, options) {
         if (controller.signal.aborted) {
             throw new Error('Hook dispatch timed out');
         }
-        const trigger = captureTriggerForEvent(event.event);
-        const hasUncapturedMeaningfulSlice = ledger !== null && (ledger.lastMeaningfulSequence ?? 0) > (ledger.lastCapturedSequence ?? 0);
-        if (trigger &&
-            isCaptureEligible(event.event, prefs, projectPolicy) &&
-            hasUncapturedMeaningfulSlice) {
+        if (willAttemptCapture && trigger && ledger) {
             const workspaceId = resolveCaptureWorkspaceId(prefs);
             const projectRoots = queueProjectRoots(roots);
             if (!workspaceId) {
@@ -702,7 +712,6 @@ export async function dispatchHookEvent(event, options) {
             creds.scopes.includes('digests:write');
         // A digest POST does not fit a hook's budget, so hooks never send: they
         // start a detached process that delivers after this hook returns.
-        const allowAutomatic = captureConsentActive(prefs) && !projectPolicy.captureDisabled;
         if (canFlush && allowAutomatic && options?.startBackgroundFlush && !controller.signal.aborted) {
             await options.startBackgroundFlush({ baseDir: options.baseDir }).catch((error) => {
                 logRuntimeEvent('warn', 'capture_background_flush_start_failed', { event: event.event, error: dispatchFailureClass(error, controller.signal.aborted) }, options?.baseDir);

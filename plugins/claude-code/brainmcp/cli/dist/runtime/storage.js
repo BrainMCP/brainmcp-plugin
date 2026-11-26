@@ -196,11 +196,12 @@ export function writeAtomic0600(filePath, content) {
 }
 export function readSafeJson(filePath, validator) {
     const resolved = path.resolve(filePath);
-    if (!fs.existsSync(resolved)) {
+    const stat = fs.lstatSync(resolved, { throwIfNoEntry: false });
+    if (!stat)
         return null;
+    if (stat.isSymbolicLink()) {
+        throw new Error(`Security violation: ${resolved} is a symbolic link`);
     }
-    assertNotSymlink(resolved);
-    const stat = fs.lstatSync(resolved);
     if (!stat.isFile()) {
         throw new Error(`Security violation: ${resolved} is not a regular file`);
     }

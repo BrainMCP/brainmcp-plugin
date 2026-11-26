@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { access, chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
-import { getBrainHome } from '../runtime/storage.js';
+import { dirname, relative, resolve, sep } from 'node:path';
+import { ensureDirectory0700, getBrainHome } from '../runtime/storage.js';
 import { ensureBackupsDir, isCleanInGit, pruneBackups, writeBackup } from './backups.js';
 export async function readText(path) {
     try {
@@ -115,7 +115,24 @@ export async function applyChanges(changes, options = {}) {
             if (symbolicLink && (await realpath(change.path)) !== writePath)
                 throw changedSincePreview(change.path);
         }
-        await mkdir(dirname(writePath), { recursive: true });
+        const resolvedHome = resolve(brainHome);
+        const parentDir = resolve(dirname(writePath));
+        const insideBrainHome = parentDir === resolvedHome ||
+            parentDir.startsWith(resolvedHome.endsWith(sep) ? resolvedHome : `${resolvedHome}${sep}`);
+        if (change.after !== undefined && insideBrainHome) {
+            ensureDirectory0700(resolvedHome);
+            let cursor = resolvedHome;
+            const rel = relative(resolvedHome, parentDir);
+            if (rel) {
+                for (const segment of rel.split(sep)) {
+                    cursor = resolve(cursor, segment);
+                    ensureDirectory0700(cursor);
+                }
+            }
+        }
+        else {
+            await mkdir(dirname(writePath), { recursive: true });
+        }
         if (item.backup) {
             // Written before the original changes; a failure leaves it untouched.
             result.backups.push({ path: change.path, backup: writeBackup(change.path, await readFile(change.path), { brainHome, now: now() }) });

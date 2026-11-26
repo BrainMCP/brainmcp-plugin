@@ -174,10 +174,11 @@ function takeOverStaleLock(lockPath, metadata) {
 /**
  * Removes the lock at `lockPath` if `isPrunable` still holds for it under the takeover guard (see
  * takeOverStaleLock), so retention never removes a lock that a takeover put in place after
- * retention read the old one. Returns whether it removed the lock.
+ * retention read the old one. Returns whether it removed the lock. `guardWaitMs` is how long a busy
+ * guard is waited for; an owner releasing its own lock waits briefly rather than leaving it.
  */
-export function removeLockIfStill(lockPath, isPrunable) {
-    const releaseGuard = acquireTakeoverGuard(lockPath, 0);
+export function removeLockIfStill(lockPath, isPrunable, guardWaitMs = 0) {
+    const releaseGuard = acquireTakeoverGuard(lockPath, guardWaitMs);
     if (!releaseGuard)
         return false;
     try {

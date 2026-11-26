@@ -162,6 +162,33 @@ export function parseCliArgs(args) {
         else
             throw new Error(`Unknown option: ${option}`);
     }
+    if (result.dryRun && command !== 'capture' && command !== 'run-due' && command !== 'flag-changed') {
+        throw new Error('--dry-run is valid only with `capture now`, `run-due`, or `flag-changed`.');
+    }
+    if (command !== 'capture' && (result.enable || result.disable || result.status || result.now || result.purge || result.includePrompts)) {
+        throw new Error('Capture action flags (--enable, --disable, --status, --now, --purge, --include-prompts) are valid only with `brainmcp capture`.');
+    }
+    if (result.json && !['login', 'logout', 'whoami', 'capture', 'bind', 'unbind', 'run-due', 'flag-changed'].includes(command)) {
+        throw new Error(`--json is not supported with \`brainmcp ${command}\`.`);
+    }
+    if (result.workspace && !['init', 'doctor', 'print', 'capture', 'bind', 'run-due'].includes(command)) {
+        throw new Error(`--workspace is not supported with \`brainmcp ${command}\`.`);
+    }
+    if (command !== 'login' && (result.captureDigests || result.force || result.allowFileCredentials || result.serviceTokenStdin || result.storeServiceToken)) {
+        throw new Error('Login options (--capture-digests, --force, --allow-file-credentials, --service-token-stdin, --store-service-token) are valid only with `brainmcp login`.');
+    }
+    if (command !== 'init' && (result.noHooks || result.writeBackNudge)) {
+        throw new Error('--no-hooks and --write-back-nudge are valid only with `brainmcp init`.');
+    }
+    if (result.ignorePlugin && command !== 'init') {
+        throw new Error('--ignore-plugin is valid only with `brainmcp init`.');
+    }
+    if (result.root && ['login', 'logout', 'whoami', 'capture'].includes(command)) {
+        throw new Error(`--root is not supported with \`brainmcp ${command}\`.`);
+    }
+    if ((result.client || result.scope) && !['init', 'doctor', 'print', 'remove'].includes(command)) {
+        throw new Error('--client and --scope are valid only with `init`, `doctor`, `print`, or `remove`.');
+    }
     if (command === 'run-due') {
         const separator = args.indexOf('--');
         if (separator !== -1)
@@ -390,7 +417,7 @@ export async function dispatch(rawArgs, context = {}) {
                     });
                 }
                 else if (parsed.disable) {
-                    result = captureDisable({ baseDir: context.baseDir });
+                    result = await captureDisable({ baseDir: context.baseDir });
                 }
                 else if (parsed.purge) {
                     const preview = capturePurgePreview({ baseDir: context.baseDir });

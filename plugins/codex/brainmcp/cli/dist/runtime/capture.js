@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CAPTURE_POLICY_VERSION, scrubDigestSecrets } from '../agent-config.js';
 import { MAX_QUEUE_PROJECT_ROOT_CHARS, MAX_QUEUE_PROJECT_ROOTS, PREFERENCES_SCHEMA_VERSION, isWorkspaceUuid, scrubSecrets, truncateCodePoints, MAX_ASSISTANT_SUMMARY_CHARS, } from '../lib/cli-contracts.js';
-import { readPreferences, writePreferences } from './storage.js';
+import { readPreferences, resolveStateDir, writePreferences } from './storage.js';
 import { listQueueItems, updateQueueItem } from './queue.js';
+import { SessionLockTimeoutError, withSessionLock } from './lock.js';
 import { logRuntimeEvent } from './diagnostics.js';
 import { bindingWalkStart, isTrustedProjectPolicyFile, readProjectWorkspaceId } from './orient.js';
 /**
@@ -495,11 +496,12 @@ export function enableCapture(options) {
     return updated;
 }
 /**
- * Disables capture and atomically cancels all pending automatic queue items (AHI-071).
- * Re-enabling never resurrects cancelled items.
+ * Persist the opt-out before waiting for the queue. The recorded revision
+ * prevents a later enable from resurrecting work withdrawn here.
  */
-export function disableCapture(options) {
-    const current = readPreferences(options?.baseDir) ?? {
+export async function disableCapture(options) {
+    const baseDir = resolveStateDir(options?.baseDir);
+    const current = readPreferences(baseDir) ?? {
         version: PREFERENCES_SCHEMA_VERSION,
         consent: {
             captureEnabled: false,
@@ -520,21 +522,27 @@ export function disableCapture(options) {
             lastDisabledRevision: revision,
         },
     };
-    writePreferences(updated, options?.baseDir);
-    // Cancel only unsent automatic items, including ones that ran out of
-    // retries: `capture now` requeues those across a later re-consent, which must
-    // not resurrect what a disable withdrew (lastDisabledRevision also keeps it
-    // from requeueing a failed item an older CLI's disable left behind). Manual
-    // items remain explicit user actions, and ambiguous in-flight deliveries
-    // retain their honest status.
-    const items = listQueueItems(options?.baseDir);
-    for (const item of items) {
-        if (item.captureTrigger !== 'manual' && (item.status === 'pending' || item.status === 'failed')) {
-            updateQueueItem(item.digestId, {
-                status: 'cancelled',
-                lastError: 'Capture disabled by user',
-            }, options?.baseDir);
-        }
+    writePreferences(updated, baseDir);
+    try {
+        await withSessionLock('capture-queue', () => {
+            for (const item of listQueueItems(baseDir)) {
+                // A later re-enable can have queued work while this call waited.
+                if (item.captureTrigger === 'manual' || (item.consentRevision ?? 0) > revision ||
+                    (item.status !== 'pending' && item.status !== 'failed') ||
+                    (item.deliveryLease && Date.parse(item.deliveryLease.expiresAt) > Date.now()))
+                    continue;
+                updateQueueItem(item.digestId, {
+                    status: 'cancelled', lastError: 'Capture disabled by user', deliveryLease: undefined,
+                }, baseDir);
+            }
+        }, { baseDir, timeoutMs: 250 });
+    }
+    catch (error) {
+        if (!(error instanceof SessionLockTimeoutError))
+            throw error;
+        // The opt-out is already effective. A later flush still checks consent
+        // before claiming or sending, and manual requeue checks the cutoff.
+        logRuntimeEvent('info', 'capture_disable_queue_busy', { waitedMs: error.waitedMs }, baseDir);
     }
     return updated;
 }

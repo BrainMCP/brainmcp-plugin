@@ -94,10 +94,12 @@ function isRecord(value) {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 function clipContext(text, maxChars) {
+    if (maxChars <= 0)
+        return '';
     if (text.length <= maxChars)
         return text;
     // Avoid splitting a UTF-16 surrogate pair at the packet or excerpt boundary.
-    return `${text.slice(0, maxChars - 1).replace(/[\uD800-\uDBFF]$/, '')}…`;
+    return `${text.slice(0, Math.max(0, maxChars - 1)).replace(/[\uD800-\uDBFF]$/, '')}…`;
 }
 /** Rule bodies (local and parent together) the hook packet shows in full or as excerpts. */
 const ORIENT_MAX_RULE_BODIES = 5;
@@ -114,6 +116,7 @@ const PARENT_STATUS_TEXT = {
     // The API answers every CLI companion with no_access: the companion itself never reads parent context.
     no_access: 'not read by this companion',
     paid_plan_required: 'paused until the paid plan is renewed',
+    two_factor_required: 'requires two-factor authentication',
     unavailable: 'unavailable',
     feature_unavailable: 'shared context is turned off',
 };
@@ -195,10 +198,23 @@ function formatOrientDetails(payload, expectedWorkspaceId) {
         const line = `Tell the user: ${action.title.trim()}${reason.trim() ? ` (${reason.trim()})` : ''}`.replace(/\s+/g, ' ');
         lines.push(clipContext(line, ORIENT_SURFACED_ACTION_MAX_CHARS));
     }
-    for (const [field, label] of [['pendingProposalCount', 'Pending proposals'], ['dueWorkflowCount', 'Due workflows']]) {
-        const count = data[field];
-        if (typeof count === 'number' && Number.isSafeInteger(count) && count > 0)
-            lines.push(`${label}: ${count}`);
+    const revisionCount = typeof data.changesRequestedProposalCount === 'number' ? data.changesRequestedProposalCount : 0;
+    const awaitingReview = typeof data.pendingProposalCount === 'number' ? data.pendingProposalCount - revisionCount : 0;
+    if (Number.isSafeInteger(awaitingReview) && awaitingReview > 0)
+        lines.push(`Pending proposals: ${awaitingReview}`);
+    if (Number.isSafeInteger(revisionCount) && revisionCount > 0)
+        lines.push(`Proposals with changes requested: ${revisionCount}`);
+    if (typeof data.dueWorkflowCount === 'number' && Number.isSafeInteger(data.dueWorkflowCount) && data.dueWorkflowCount > 0) {
+        lines.push(`Due workflows: ${data.dueWorkflowCount}`);
+    }
+    if (Array.isArray(data.revisionRequests)) {
+        const requests = data.revisionRequests.filter((request) => isRecord(request) && typeof request.title === 'string'
+            && typeof request.feedback === 'string' && typeof request.resourceUri === 'string').slice(0, 5);
+        for (const request of requests) {
+            const title = clipContext(request.title.replace(/\s+/g, ' '), 120);
+            const feedback = clipContext(request.feedback.replace(/\s+/g, ' '), 200);
+            lines.push(`Changes requested on ${title}: ${JSON.stringify(feedback)}. Read the proposal and feedback at ${clipContext(request.resourceUri, 300)}.`);
+        }
     }
     const rules = isRecord(data.rules) ? data.rules : undefined;
     const items = Array.isArray(rules?.items) ? rules.items : [];
@@ -393,10 +409,10 @@ export function readProjectWorkspaceId(startDir, homeDir = os.homedir()) {
     const home = bindingWalkStart(homeDir);
     for (let depth = 0; depth < 16; depth += 1) {
         const configPath = path.join(dir, '.brainmcp.json');
-        if (fs.existsSync(configPath) && isTrustedProjectPolicyFile(dir, fs.lstatSync(configPath))) {
-            try {
-                const stat = fs.lstatSync(configPath);
-                if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) {
+        try {
+            const stat = fs.lstatSync(configPath, { throwIfNoEntry: false });
+            if (stat && isTrustedProjectPolicyFile(dir, stat)) {
+                if (!stat.isFile() || stat.size > 64 * 1024) {
                     return { kind: 'invalid', configPath };
                 }
                 const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -409,9 +425,9 @@ export function readProjectWorkspaceId(startDir, homeDir = os.homedir()) {
                     ? { kind: 'workspace', configPath, workspaceId }
                     : { kind: 'invalid', configPath };
             }
-            catch {
-                return { kind: 'invalid', configPath };
-            }
+        }
+        catch {
+            return { kind: 'invalid', configPath };
         }
         // The Git root (a nested worktree's is its main checkout) and the home directory bound the walk.
         if (gitEntryEndsBindingWalk(dir) || dir === home)

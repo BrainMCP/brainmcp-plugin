@@ -12,20 +12,22 @@ export function normalizeRuntimeVersion(version) {
     }
     return normalized;
 }
-export function getRuntimesDir(baseDir) {
+export function getRuntimesDir(baseDir, create = false) {
     const home = baseDir ?? getBrainHome();
     const runtimesDir = path.join(home, 'runtime');
-    ensureDirectory0700(runtimesDir);
+    if (create)
+        ensureDirectory0700(runtimesDir);
     return runtimesDir;
 }
-export function getVersionedRuntimeDir(version, baseDir) {
-    const runtimesDir = getRuntimesDir(baseDir);
+export function getVersionedRuntimeDir(version, baseDir, create = false) {
+    const runtimesDir = getRuntimesDir(baseDir, create);
     const versionDir = path.join(runtimesDir, `v${normalizeRuntimeVersion(version)}`);
-    ensureDirectory0700(versionDir);
+    if (create)
+        ensureDirectory0700(versionDir);
     return versionDir;
 }
 export function getVersionedRuntimePath(version, baseDir) {
-    const versionDir = getVersionedRuntimeDir(version, baseDir);
+    const versionDir = getVersionedRuntimeDir(version, baseDir, false);
     return path.join(versionDir, 'brainmcp-hook-runtime.mjs');
 }
 /**
@@ -86,6 +88,7 @@ export function readRuntimeShimTarget(baseDir) {
  * `init` writes the same text through its previewed, atomic file changes.
  */
 export function installRuntimeShim(version, baseDir) {
+    getRuntimesDir(baseDir, true);
     const shimPath = getRuntimeShimPath(baseDir);
     assertNotSymlink(shimPath);
     const tmpPath = `${shimPath}.tmp.${crypto.randomUUID()}`;
@@ -108,7 +111,7 @@ export function installRuntimeShim(version, baseDir) {
  * Installs runtime bundle atomically to ~/.brainmcp/runtime/v<version>/brainmcp-hook-runtime.mjs (AHI-052).
  */
 export function installRuntimeBundle(version, bundleContent, baseDir) {
-    const versionDir = getVersionedRuntimeDir(version, baseDir);
+    const versionDir = getVersionedRuntimeDir(version, baseDir, true);
     const targetPath = path.join(versionDir, 'brainmcp-hook-runtime.mjs');
     assertNotSymlink(targetPath);
     const tmpPath = `${targetPath}.tmp.${crypto.randomUUID()}`;
@@ -135,7 +138,9 @@ export function installRuntimeBundle(version, bundleContent, baseDir) {
  * Lists all currently installed runtime versions.
  */
 export function listInstalledRuntimes(baseDir) {
-    const runtimesDir = getRuntimesDir(baseDir);
+    const runtimesDir = getRuntimesDir(baseDir, false);
+    if (!fs.existsSync(runtimesDir))
+        return [];
     const entries = fs.readdirSync(runtimesDir);
     const runtimes = [];
     for (const entry of entries) {
@@ -191,6 +196,29 @@ export function removeRuntimeVersion(version, referencedPaths, baseDir) {
         return { removed: true };
     }
     return { removed: false, blockedReason: `Runtime v${version} does not exist` };
+}
+/**
+ * Prunes unreferenced versioned runtime directories older than `maxAgeMs` beyond
+ * the newest `keepLatest` installations. Always keeps the shim target and any
+ * explicitly referenced path.
+ */
+export function pruneUnreferencedRuntimes(options) {
+    const baseDir = options?.baseDir;
+    const keepLatest = Math.max(1, options?.keepLatest ?? 2);
+    const maxAgeMs = options?.maxAgeMs ?? 30 * 24 * 60 * 60 * 1000;
+    const now = options?.now ?? Date.now();
+    const referencedPaths = options?.referencedPaths ?? [];
+    const installed = listInstalledRuntimes(baseDir).sort((a, b) => Date.parse(b.installedAt) - Date.parse(a.installedAt));
+    const removed = [];
+    for (const runtime of installed.slice(keepLatest)) {
+        const installedAtMs = Date.parse(runtime.installedAt);
+        if (!Number.isFinite(installedAtMs) || now - installedAtMs <= maxAgeMs)
+            continue;
+        if (removeRuntimeVersion(runtime.version, referencedPaths, baseDir).removed) {
+            removed.push(runtime.version);
+        }
+    }
+    return removed;
 }
 // The version names the installed hook runtime directory, so an unreadable package.json must fail
 // rather than report (and install under) a made-up version.

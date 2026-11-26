@@ -35,6 +35,7 @@ export async function startCallbackServer(options) {
     let isConsumed = false;
     let server = null;
     let timeoutHandle = null;
+    let closeDelayHandle = null;
     let resolveResult;
     let rejectResult;
     const resultPromise = new Promise((resolve, reject) => {
@@ -48,6 +49,10 @@ export async function startCallbackServer(options) {
             clearTimeout(timeoutHandle);
             timeoutHandle = null;
         }
+        if (closeDelayHandle) {
+            clearTimeout(closeDelayHandle);
+            closeDelayHandle = null;
+        }
         if (server) {
             const s = server;
             server = null;
@@ -60,20 +65,42 @@ export async function startCallbackServer(options) {
             await closed;
         }
     };
+    const scheduleClose = () => {
+        if (closeDelayHandle)
+            clearTimeout(closeDelayHandle);
+        closeDelayHandle = setTimeout(() => void closeServer(), 500);
+        closeDelayHandle.unref();
+    };
     server = createServer((req, res) => {
+        if (req.method !== 'GET') {
+            res.writeHead(405, { 'Content-Type': 'text/plain', Allow: 'GET' });
+            res.end('Method Not Allowed');
+            return;
+        }
         if (!req.url) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Bad Request');
             return;
         }
         const hostHeader = req.headers.host;
-        // Strict host check: must be 127.0.0.1 or localhost with optional port
-        if (!hostHeader || !/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(hostHeader)) {
+        // Strict host check: 127.0.0.1 or localhost, and a port only if it is the one this request reached.
+        const host = hostHeader ? /^(?:127\.0\.0\.1|localhost)(?::(\d{1,5}))?$/.exec(hostHeader) : null;
+        if (!host || (host[1] !== undefined && Number(host[1]) !== req.socket.localPort)) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Invalid host header');
             return;
         }
-        const parsedUrl = new URL(req.url, `http://${hostHeader}`);
+        // Parsed against a fixed base, never the Host header. The request target alone can still be an
+        // unparseable absolute URL (`http://localhost:99999/...`), and a throw here would end `brainmcp login`.
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(req.url, 'http://127.0.0.1');
+        }
+        catch {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Bad Request');
+            return;
+        }
         // Path verification
         if (parsedUrl.pathname !== expectedPathname) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -107,7 +134,7 @@ export async function startCallbackServer(options) {
                 error: 'invalid_issuer',
                 errorDescription: 'The authorization response named an unexpected issuer (iss); the login was stopped.',
             });
-            setTimeout(() => void closeServer(), 500);
+            scheduleClose();
             return;
         }
         const error = parsedUrl.searchParams.get('error');
@@ -117,20 +144,20 @@ export async function startCallbackServer(options) {
             res.writeHead(200, { 'Content-Type': 'text/html' });
             res.end(ERROR_HTML(errorDescription || `Error: ${error}`));
             resolveResult({ error, errorDescription });
-            setTimeout(() => void closeServer(), 500);
+            scheduleClose();
             return;
         }
         if (!code) {
             res.writeHead(400, { 'Content-Type': 'text/html' });
             res.end(ERROR_HTML('Missing authorization code in callback.'));
             resolveResult({ error: 'missing_code', errorDescription: 'Authorization code was not provided.' });
-            setTimeout(() => void closeServer(), 500);
+            scheduleClose();
             return;
         }
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(SUCCESS_HTML);
         resolveResult({ code });
-        setTimeout(() => void closeServer(), 500);
+        scheduleClose();
     });
     // Bind exclusively to 127.0.0.1 port 0
     await new Promise((resolve, reject) => {
